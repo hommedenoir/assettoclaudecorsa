@@ -15,6 +15,7 @@ Requirements
 
 Usage
   python t248_screen_bridge.py --selftest      # checks the logic, no hardware
+  python t248_screen_bridge.py --list-devices  # which Thrustmaster devices the SDK sees and what each can do
   python t248_screen_bridge.py --probe         # init the SDK, open the wheel, send one frame
   python t248_screen_bridge.py --simulate      # sweep fake values on the wheel screen
   python t248_screen_bridge.py                 # normal use: follow Assetto Corsa
@@ -277,7 +278,7 @@ def dll_candidates(sdk_dir, explicit=None):
     return out
 
 
-REQUIRED_EXPORTS = ("tm_api_init", "tm_api_exit", "tm_api_get_device_count", "tm_api_open_device",
+REQUIRED_EXPORTS = ("tm_api_init", "tm_api_exit", "tm_api_get_device_count", "tm_api_get_device_info", "tm_api_open_device",
                     "tm_api_close_device", "tm_api_set_properties", "tm_api_update")
 
 
@@ -398,6 +399,46 @@ def resolve_hwnd(mode, explicit=None):
     return console_window(), "console window"
 
 
+INFO_SIZE = 0x648       # size of the device-info structure; its first DWORD must hold this value
+
+
+def parse_device_info(raw):
+    """Decode the structure filled in by tm_api_get_device_info (layout taken from the SDK test app)."""
+    if len(raw) < INFO_SIZE:
+        raise ValueError("device info too short")
+    axes_mask, = struct.unpack_from("<I", raw, 0x08)
+    axes, buttons, analog, povs, encoders, vec4, motors, fslots, audio, leds, screens = \
+        struct.unpack_from("<11H", raw, 0x0C)
+    name = raw[0x210:0x210 + 0x104 * 2].decode("utf-16-le", errors="ignore").split("\x00", 1)[0].strip()
+    return {"name": name or "(unnamed)", "axes": axes, "axes_mask": axes_mask, "buttons": buttons,
+            "analog_buttons": analog, "povs": povs, "encoders": encoders, "vec4": vec4,
+            "motors": motors, "force_slots": fslots, "audio": audio, "leds": leds, "screens": screens}
+
+
+def describe_device(i, info):
+    return ("#%d %s | screens=%d leds=%d motors=%d force_slots=%d audio=%d | axes=%d buttons=%d povs=%d"
+            % (i, info["name"], info["screens"], info["leds"], info["motors"], info["force_slots"],
+               info["audio"], info["axes"], info["buttons"], info["povs"]))
+
+
+def pick_device(infos, requested=None):
+    """Choose which SDK device to drive. requested: an index, or None for automatic.
+    Automatic prefers a device with a screen, then one with LEDs, then device 0."""
+    if not infos:
+        raise RuntimeError("no devices to choose from")
+    if requested is not None:
+        if not 0 <= requested < len(infos):
+            raise RuntimeError("device %d does not exist (the SDK reports %d device(s))" % (requested, len(infos)))
+        return requested, "chosen with --device"
+    for i, inf in enumerate(infos):
+        if inf["screens"] > 0:
+            return i, "first device with a screen"
+    for i, inf in enumerate(infos):
+        if inf["leds"] > 0:
+            return i, "no screen found; first device with LEDs"
+    return 0, "no screen or LEDs reported; using device 0"
+
+
 class TmSdk:
     """Thin ctypes wrapper over tm_api_* with the signatures seen in the SDK test app."""
 
@@ -422,6 +463,7 @@ class TmSdk:
         d.tm_api_get_device_count.argtypes = [ctypes.POINTER(ctypes.c_int)];       d.tm_api_get_device_count.restype = ctypes.c_int
         d.tm_api_open_device.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
         d.tm_api_open_device.restype = ctypes.c_int
+        d.tm_api_get_device_info.argtypes = [ctypes.c_int, ctypes.c_void_p];       d.tm_api_get_device_info.restype = ctypes.c_int
         d.tm_api_close_device.argtypes = [ctypes.c_int];                           d.tm_api_close_device.restype = ctypes.c_int
         d.tm_api_set_properties.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p]
         d.tm_api_set_properties.restype = ctypes.c_int
@@ -430,7 +472,8 @@ class TmSdk:
         self._rec = ctypes.create_string_buffer(RECORD_SIZE)
         self._upd = ctypes.create_string_buffer(0x2000)       # the app clears 0x140c bytes; be generous
 
-    def connect(self, device_index=0, hwnd=0, timeout=8.0):
+    def start(self, hwnd=0, timeout=8.0):
+        """Initialise the SDK and wait for it to find devices. Returns the device count."""
         d = self.dll
         block = ctypes.create_string_buffer(build_init_block(hwnd), 12)
         rc = call_sdk("tm_api_init", d.tm_api_init, 0, ctypes.addressof(block))
@@ -448,10 +491,37 @@ class TmSdk:
         if rc != 0 or n <= 0:
             raise RuntimeError("SDK reports no devices after %.0fs (rc=%s count=%s). Is the wheel plugged in "
                                "and the Thrustmaster driver installed?" % (timeout, rc, n))
+        return n
+
+    def enumerate(self, count):
+        """Ask the SDK what each device is and what it can do."""
+        infos = []
+        for i in range(count):
+            buf = ctypes.create_string_buffer(INFO_SIZE)
+            struct.pack_into("<I", buf, 0, INFO_SIZE)
+            rc = call_sdk("tm_api_get_device_info", self.dll.tm_api_get_device_info, i, ctypes.addressof(buf))
+            if rc != 0:
+                log.warning("tm_api_get_device_info(%d) -> rc=%s", i, rc)
+                infos.append({"name": "(unknown)", "screens": 0, "leds": 0, "motors": 0, "force_slots": 0,
+                              "audio": 0, "axes": 0, "buttons": 0, "povs": 0})
+                continue
+            info = parse_device_info(buf.raw)
+            infos.append(info)
+            log.info("device %s", describe_device(i, info))
+        return infos
+
+    def connect(self, device_index=None, hwnd=0, timeout=8.0):
+        """device_index None = choose automatically (a device with a screen first)."""
+        n = self.start(hwnd, timeout)
+        infos = self.enumerate(n)
+        idx, why = pick_device(infos, device_index)
+        log.info("Driving device #%d (%s): %s", idx, infos[idx]["name"], why)
+        if infos[idx]["screens"] == 0:
+            log.warning("This device reports no screen; LEDs or nothing may respond")
         h = ctypes.c_int(0)
-        rc = call_sdk("tm_api_open_device", d.tm_api_open_device, device_index, ctypes.byref(h))
+        rc = call_sdk("tm_api_open_device", self.dll.tm_api_open_device, idx, ctypes.byref(h))
         log.info("tm_api_open_device(%s) -> rc=%s handle=0x%x (foreground window now 0x%x)",
-                 device_index, rc, h.value, foreground_window())
+                 idx, rc, h.value, foreground_window())
         if rc != 0:
             raise RuntimeError("tm_api_open_device failed with code %s" % rc)
         self.handle = h.value
@@ -497,7 +567,7 @@ class FakeSdk:
     def __init__(self, fail_after=None):
         self.calls, self.connected, self.closed, self.fail_after = [], 0, 0, fail_after
 
-    def connect(self, device_index=0, hwnd=0, timeout=0):
+    def connect(self, device_index=None, hwnd=0, timeout=0):
         self.connected += 1
 
     def set_prop(self, pid, ptype, value):
@@ -696,6 +766,25 @@ def run_simulate(sender, rate):
     sender.close()
 
 
+def run_list_devices(factory):
+    sdk = factory()
+    try:
+        hwnd, _ = resolve_hwnd("console")
+        n = sdk.start(hwnd, 8.0)
+        infos = sdk.enumerate(n)
+        print("\nThe SDK reports %d device(s):" % n)
+        for i, inf in enumerate(infos):
+            print("  " + describe_device(i, inf))
+        idx, why = pick_device(infos, None)
+        print("\nAutomatic choice: device #%d (%s)" % (idx, why))
+        return 0
+    except Exception as e:
+        log.error("could not list devices: %s", e)
+        return 1
+    finally:
+        sdk.close()
+
+
 def run_probe(sender, hold=8.0):
     log.info("PROBE: connecting and sending one frame (gear 3, 4500 rpm, 90 km/h)")
     t = Telemetry(live=True, gear="3", rpm=4500, rpm_percent=60.0, speed_kmh=90.0, current_ms=65432)
@@ -819,6 +908,35 @@ def selftest():
             self.assertEqual(len(attempts), 3)
             self.assertIsNone(s.sdk)
 
+        def _info_bytes(self, name="Thrustmaster T248", screens=1, leds=0, motors=2):
+            b = bytearray(INFO_SIZE)
+            struct.pack_into("<I", b, 0, INFO_SIZE)
+            struct.pack_into("<I", b, 0x08, 0x3F)
+            struct.pack_into("<11H", b, 0x0C, 6, 25, 0, 1, 0, 0, motors, 8, 0, leds, screens)
+            b[0x210:0x210 + 2 * (len(name) + 1)] = (name + "\0").encode("utf-16-le")
+            return bytes(b)
+
+        def test_parse_device_info(self):
+            inf = parse_device_info(self._info_bytes())
+            self.assertEqual((inf["name"], inf["screens"], inf["leds"], inf["motors"]), ("Thrustmaster T248", 1, 0, 2))
+            self.assertEqual((inf["axes"], inf["buttons"], inf["force_slots"], inf["axes_mask"]), (6, 25, 8, 0x3F))
+            with self.assertRaises(ValueError):
+                parse_device_info(b"short")
+            self.assertEqual(parse_device_info(bytes(INFO_SIZE))["name"], "(unnamed)")
+
+        def test_pick_device(self):
+            wheel = parse_device_info(self._info_bytes(screens=1))
+            pedals = parse_device_info(self._info_bytes("Pedals", screens=0, leds=0))
+            leds_only = parse_device_info(self._info_bytes("LED wheel", screens=0, leds=8))
+            self.assertEqual(pick_device([pedals, wheel])[0], 1)               # screen wins, wherever it is
+            self.assertEqual(pick_device([pedals, leds_only])[0], 1)           # LEDs next best
+            self.assertEqual(pick_device([pedals, pedals])[0], 0)              # nothing special: device 0
+            self.assertEqual(pick_device([wheel, wheel], 1), (1, "chosen with --device"))
+            with self.assertRaises(RuntimeError):
+                pick_device([wheel], 3)
+            with self.assertRaises(RuntimeError):
+                pick_device([])
+
         def test_sources_registry(self):
             self.assertIn("ac", SOURCES)
             self.assertTrue(issubclass(SOURCES["ac"], TelemetrySource))
@@ -926,7 +1044,8 @@ def main():
     ap.add_argument("--rate", type=float, default=30.0, help="updates per second (default 30)")
     ap.add_argument("--sdk-dir", help="folder containing tm_api_lib_x64.dll (the 'tmsdk' folder)")
     ap.add_argument("--dll", help="path to the 64-bit DLL that exports tm_api_* (default: searched automatically)")
-    ap.add_argument("--device", type=int, default=0, help="SDK device index (default 0)")
+    ap.add_argument("--device", default="auto", help="SDK device index, or 'auto' (default): a device with a screen first")
+    ap.add_argument("--list-devices", action="store_true", help="show the Thrustmaster devices the SDK sees, and what each can do, then exit")
     ap.add_argument("--hwnd", help="window handle to give the SDK (e.g. 0x1A2B3C); default: the game window, or this console")
     ap.add_argument("--connect-timeout", type=float, default=8.0, help="seconds to wait for the SDK to find the wheel")
     ap.add_argument("--verbose", action="store_true")
@@ -944,6 +1063,11 @@ def main():
         log.error("This needs 64-bit Python (the Thrustmaster SDK DLL is 64-bit).")
         return 2
 
+    try:
+        device_choice = None if str(a.device).lower() == "auto" else int(a.device)
+    except ValueError:
+        log.error("--device must be 'auto' or a number")
+        return 2
     explicit = int(a.hwnd, 0) if a.hwnd else None
     mode = "game" if not (a.probe or a.simulate) else "console"
 
@@ -954,10 +1078,12 @@ def main():
         def connect(idx=0):
             hwnd, what = resolve_hwnd(mode, explicit)
             log.info("Using %s as the SDK window: 0x%x", what, hwnd or 0)
-            orig(a.device, hwnd, a.connect_timeout)
+            orig(device_choice, hwnd, a.connect_timeout)
         sdk.connect = connect
         return sdk
 
+    if a.list_devices:
+        return run_list_devices(factory)
     sender = Sender(factory, race_info=a.race_info)
     if a.probe:
         return run_probe(sender, a.hold)
