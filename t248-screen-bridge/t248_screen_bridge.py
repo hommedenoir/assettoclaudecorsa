@@ -21,6 +21,14 @@ Usage
   python t248_screen_bridge.py                 # normal use: follow Assetto Corsa
   python t248_screen_bridge.py --dry-run       # read AC, print what would be sent, touch no hardware
 
+Sending telemetry elsewhere (any combination; the wheel keeps working alongside)
+  python t248_screen_bridge.py --list-fields                      # every selectable value
+  python t248_screen_bridge.py --serve 8080 --fields core,tyres   # live web dashboard on this PC
+  python t248_screen_bridge.py --serve 0.0.0.0:8080 --fields all  # same, for a tablet or second PC on your network
+  python t248_screen_bridge.py --udp 192.168.1.20:20777           # JSON datagrams for other software
+  python t248_screen_bridge.py --no-wheel --serve 8080            # outputs only, no wheel or SDK needed
+  python t248_screen_bridge.py --simulate --no-wheel --serve 8080 # try the dashboard without the game
+
 Everything it learns is written to t248_bridge.log next to this script.
 
 STATUS: written from reverse engineering of the SDK and of USB captures. The
@@ -32,13 +40,18 @@ Run --probe first and send back t248_bridge.log if anything fails.
 import argparse
 import ctypes
 import glob
+import json
 import logging
 import os
+import math
 import signal
+import socket
 import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
 # --------------------------------------------------------------------------
@@ -137,6 +150,399 @@ def parse_ac_pages(physics, graphics, static, max_rpm_cache):
 # Shared memory reader (Windows). Opens the EXISTING mapping read-only, so it
 # can never create a mapping that would interfere with the game.
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Full telemetry: a declarative table of everything Assetto Corsa publishes
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Field:
+    name: str
+    page: str          # 'physics', 'graphics' or 'static'
+    offset: int
+    fmt: str           # 'i' int32, 'f' float32, '4f' float array, 'w33' UTF-16 string of 33 characters
+    group: str
+    desc: str
+    lo: float = None   # plausible range, used only to warn when the layout looks wrong
+    hi: float = None
+
+    @property
+    def size(self):
+        if self.fmt.startswith("w"):
+            return int(self.fmt[1:]) * 2
+        return 4 * (int(self.fmt[:-1]) if len(self.fmt) > 1 else 1)
+
+    @property
+    def count(self):
+        return 1 if self.fmt in ("i", "f") or self.fmt.startswith("w") else int(self.fmt[:-1])
+
+
+def _f(*a, **k):
+    return Field(*a, **k)
+
+
+# Layout follows Assetto Corsa's published shared-memory structures. Arrays are ordered FL, FR, RL, RR.
+FIELDS = [
+    # physics page
+    _f("packet_id", "physics", 0, "i", "meta", "physics packet counter (changes while the game runs)"),
+    _f("gas", "physics", 4, "f", "driver", "throttle pedal, 0 to 1", 0, 1),
+    _f("brake", "physics", 8, "f", "driver", "brake pedal, 0 to 1", 0, 1),
+    _f("fuel", "physics", 12, "f", "engine", "fuel in tank, litres", 0, 1000),
+    _f("gear_raw", "physics", 16, "i", "engine", "gear as AC numbers it: 0 reverse, 1 neutral, 2 first", 0, 12),
+    _f("rpm", "physics", 20, "i", "engine", "engine revolutions per minute", 0, 30000),
+    _f("steer_angle", "physics", 24, "f", "driver", "steering angle, game units"),
+    _f("speed_kmh", "physics", 28, "f", "dynamics", "speed, km/h", 0, 700),
+    _f("velocity", "physics", 32, "3f", "dynamics", "velocity vector x, y, z, m/s"),
+    _f("acc_g", "physics", 44, "3f", "dynamics", "acceleration x, y, z, in g", -15, 15),
+    _f("wheel_slip", "physics", 56, "4f", "tyres", "wheel slip per tyre"),
+    _f("wheel_load", "physics", 72, "4f", "tyres", "load per wheel, newtons", -1000, 40000),
+    _f("tyre_pressure", "physics", 88, "4f", "tyres", "tyre pressure, psi", 0, 80),
+    _f("wheel_angular_speed", "physics", 104, "4f", "tyres", "wheel angular speed, rad/s"),
+    _f("tyre_wear", "physics", 120, "4f", "tyres", "tyre wear per tyre"),
+    _f("tyre_dirt", "physics", 136, "4f", "tyres", "tyre dirt level per tyre"),
+    _f("tyre_core_temp", "physics", 152, "4f", "tyres", "tyre core temperature, degC", -60, 400),
+    _f("camber_rad", "physics", 168, "4f", "suspension", "camber per wheel, radians"),
+    _f("suspension_travel", "physics", 184, "4f", "suspension", "suspension travel per wheel, metres"),
+    _f("drs", "physics", 200, "f", "electronics", "DRS state, 0 to 1", 0, 1),
+    _f("tc", "physics", 204, "f", "electronics", "traction control activity, 0 to 1", 0, 1),
+    _f("heading", "physics", 208, "f", "dynamics", "heading, radians"),
+    _f("pitch", "physics", 212, "f", "dynamics", "pitch, radians"),
+    _f("roll", "physics", 216, "f", "dynamics", "roll, radians"),
+    _f("cg_height", "physics", 220, "f", "car", "centre of gravity height, metres"),
+    _f("car_damage", "physics", 224, "5f", "car", "damage: front, rear, left, right, centre", 0, 5000),
+    _f("tyres_out", "physics", 244, "i", "car", "number of tyres off the track", 0, 4),
+    _f("pit_limiter", "physics", 248, "i", "electronics", "pit limiter on, 0 or 1", 0, 1),
+    _f("abs", "physics", 252, "f", "electronics", "ABS activity, 0 to 1", 0, 1),
+    _f("kers_charge", "physics", 256, "f", "electronics", "KERS charge, 0 to 1"),
+    _f("kers_input", "physics", 260, "f", "electronics", "KERS input"),
+    _f("auto_shifter", "physics", 264, "i", "electronics", "automatic gearbox on, 0 or 1", 0, 1),
+    _f("ride_height", "physics", 268, "2f", "suspension", "ride height front, rear"),
+    _f("turbo_boost", "physics", 276, "f", "engine", "turbo boost", 0, 20),
+    _f("ballast", "physics", 280, "f", "car", "ballast, kg"),
+    _f("air_density", "physics", 284, "f", "environment", "air density", 0, 3),
+    _f("air_temp", "physics", 288, "f", "environment", "air temperature, degC", -60, 80),
+    _f("road_temp", "physics", 292, "f", "environment", "road temperature, degC", -60, 120),
+    _f("local_angular_vel", "physics", 296, "3f", "dynamics", "angular velocity x, y, z"),
+    _f("final_ff", "physics", 308, "f", "driver", "final force feedback output"),
+    _f("performance_meter", "physics", 312, "f", "lap", "performance meter: time delta to the best lap"),
+    _f("engine_brake", "physics", 316, "i", "electronics", "engine brake setting"),
+    _f("ers_recovery_level", "physics", 320, "i", "electronics", "ERS recovery level"),
+    _f("ers_power_level", "physics", 324, "i", "electronics", "ERS power level"),
+    _f("ers_heat_charging", "physics", 328, "i", "electronics", "ERS heat charging"),
+    _f("ers_is_charging", "physics", 332, "i", "electronics", "ERS charging, 0 or 1", 0, 1),
+    _f("kers_current_kj", "physics", 336, "f", "electronics", "KERS energy used this lap, kJ"),
+    _f("drs_available", "physics", 340, "i", "electronics", "DRS available, 0 or 1", 0, 1),
+    _f("drs_enabled", "physics", 344, "i", "electronics", "DRS enabled, 0 or 1", 0, 1),
+    _f("brake_temp", "physics", 348, "4f", "brakes", "brake disc temperature, degC", -60, 2500),
+    _f("clutch", "physics", 364, "f", "driver", "clutch pedal, 0 to 1 (1 = released)", 0, 1),
+    _f("tyre_temp_inner", "physics", 368, "4f", "tyres", "tyre inner temperature, degC", -60, 400),
+    _f("tyre_temp_middle", "physics", 384, "4f", "tyres", "tyre middle temperature, degC", -60, 400),
+    _f("tyre_temp_outer", "physics", 400, "4f", "tyres", "tyre outer temperature, degC", -60, 400),
+    # graphics page
+    _f("status", "graphics", 4, "i", "session", "0 off, 1 replay, 2 live, 3 pause", 0, 3),
+    _f("session_type", "graphics", 8, "i", "session", "session type: 0 unknown, 1 practice, 2 qualify, 3 race ...", -1, 12),
+    _f("completed_laps", "graphics", 132, "i", "lap", "laps completed", 0, 100000),
+    _f("position", "graphics", 136, "i", "lap", "race position", 0, 200),
+    _f("current_time_ms", "graphics", 140, "i", "lap", "current lap time, ms", 0, 36000000),
+    _f("last_time_ms", "graphics", 144, "i", "lap", "last lap time, ms", 0, 36000000),
+    _f("best_time_ms", "graphics", 148, "i", "lap", "best lap time reported by the game, ms", 0, 36000000),
+    _f("session_time_left", "graphics", 152, "f", "session", "session time left, ms"),
+    _f("distance_traveled", "graphics", 156, "f", "session", "distance driven, metres"),
+    _f("is_in_pit", "graphics", 160, "i", "session", "in the pit, 0 or 1", 0, 1),
+    _f("current_sector", "graphics", 164, "i", "lap", "current sector index", 0, 20),
+    _f("last_sector_time_ms", "graphics", 168, "i", "lap", "last sector time, ms", 0, 36000000),
+    _f("number_of_laps", "graphics", 172, "i", "lap", "laps in the session", 0, 100000),
+    _f("tyre_compound", "graphics", 176, "w33", "car", "tyre compound name"),
+    _f("replay_time_multiplier", "graphics", 244, "f", "session", "replay speed multiplier"),
+    _f("normalized_car_position", "graphics", 248, "f", "lap", "position around the lap, 0 to 1", -0.01, 1.01),
+    _f("car_coordinates", "graphics", 252, "3f", "dynamics", "world position x, y, z, metres"),
+    _f("penalty_time", "graphics", 264, "f", "session", "penalty time, seconds", 0, 100000),
+    _f("flag", "graphics", 268, "i", "session", "flag shown: 0 none, 1 blue, 2 yellow, 3 black, 4 white, 5 checkered", 0, 12),
+    _f("ideal_line_on", "graphics", 272, "i", "session", "ideal line shown, 0 or 1", 0, 1),
+    _f("is_in_pit_lane", "graphics", 276, "i", "session", "in the pit lane, 0 or 1", 0, 1),
+    _f("surface_grip", "graphics", 280, "f", "environment", "track surface grip", 0, 2),
+    _f("mandatory_pit_done", "graphics", 284, "i", "session", "mandatory pit stop done, 0 or 1", 0, 1),
+    _f("wind_speed", "graphics", 288, "f", "environment", "wind speed, m/s", 0, 200),
+    _f("wind_direction", "graphics", 292, "f", "environment", "wind direction, degrees"),
+    # static page
+    _f("number_of_sessions", "static", 60, "i", "session", "sessions in the event", 0, 50),
+    _f("num_cars", "static", 64, "i", "session", "cars in the session", 0, 500),
+    _f("car_model", "static", 68, "w33", "car", "car model id"),
+    _f("track", "static", 134, "w33", "session", "track id"),
+    _f("sector_count", "static", 400, "i", "session", "sectors on the track", 0, 20),
+    _f("max_torque", "static", 404, "f", "car", "maximum torque, Nm", 0, 20000),
+    _f("max_power", "static", 408, "f", "car", "maximum power, W", 0, 5000000),
+    _f("max_rpm", "static", 412, "i", "car", "engine rev limit", 0, 30000),
+    _f("max_fuel", "static", 416, "f", "car", "fuel tank capacity, litres", 0, 1000),
+]
+# Values the bridge computes itself from the fields above.
+DERIVED = [
+    ("gear", "core", "gear as a character: R, N, 1 to 9"),
+    ("rpm_percent", "core", "RPM as a percentage of the rev limit, 0 to 100"),
+]
+GROUP_EXTRA = {   # groups made of several kinds of field
+    "core": ["gear", "rpm", "rpm_percent", "speed_kmh", "gas", "brake", "clutch", "fuel"],
+}
+FIELD_BY_NAME = {f.name: f for f in FIELDS}
+ALL_NAMES = [f.name for f in FIELDS] + [n for n, _g, _d in DERIVED]
+
+
+def decode_fields(pages):
+    """Read every field from raw page bytes. Fields beyond the end of a page come back as None."""
+    out = {}
+    for f in FIELDS:
+        buf = pages.get(f.page)
+        if buf is None or f.offset + f.size > len(buf):
+            out[f.name] = None
+            continue
+        if f.fmt.startswith("w"):
+            raw = bytes(buf[f.offset:f.offset + f.size])
+            out[f.name] = raw.decode("utf-16-le", errors="ignore").split("\x00", 1)[0].strip()
+        elif f.count == 1:
+            out[f.name], = struct.unpack_from("<" + f.fmt, buf, f.offset)
+        else:
+            out[f.name] = list(struct.unpack_from("<%d%s" % (f.count, f.fmt[-1]), buf, f.offset))
+    return out
+
+
+def add_derived(values, max_rpm_cache=0):
+    """Add gear and rpm_percent. Returns the max_rpm used."""
+    g = values.get("gear_raw")
+    values["gear"] = ac_gear_to_char(g) if isinstance(g, int) else None
+    max_rpm = values.get("max_rpm")
+    if not (isinstance(max_rpm, int) and 1000 <= max_rpm <= 30000):
+        max_rpm = max_rpm_cache
+    rpm = values.get("rpm")
+    values["rpm_percent"] = round(rpm_to_percent(rpm, max_rpm), 1) if isinstance(rpm, int) and max_rpm else None
+    return max_rpm
+
+
+def select_fields(spec, available=None):
+    """Turn 'core,tyres,-tyre_wear' into an ordered list of field names.
+    Tokens may be field names, group names, 'all', or a name/group with a leading '-' to remove it."""
+    available = list(available or ALL_NAMES)
+    groups = {}
+    for f in FIELDS:
+        groups.setdefault(f.group, []).append(f.name)
+    for n, g, _d in DERIVED:
+        groups.setdefault(g, []).append(n)
+    for g, names in GROUP_EXTRA.items():
+        groups[g] = [n for n in names if n in available]
+    chosen, errors = [], []
+    for tok in [t.strip() for t in str(spec).split(",") if t.strip()]:
+        remove = tok.startswith("-")
+        tok = tok.lstrip("-")
+        names = available if tok == "all" else groups.get(tok) or ([tok] if tok in available else None)
+        if names is None:
+            errors.append(tok)
+            continue
+        for n in names:
+            if remove:
+                chosen = [c for c in chosen if c != n]
+            elif n not in chosen:
+                chosen.append(n)
+    if errors:
+        raise ValueError("unknown field or group: %s" % ", ".join(errors))
+    return chosen
+
+
+def field_catalog():
+    """Metadata for every selectable value: used by --list-fields and the dashboard."""
+    cat = [{"name": f.name, "group": f.group, "desc": f.desc, "count": f.count} for f in FIELDS]
+    cat += [{"name": n, "group": g, "desc": d, "count": 1} for n, g, d in DERIVED]
+    return cat
+
+
+def clean_json(value):
+    """Make a value safe for strict JSON: NaN and infinity become null, floats are rounded."""
+    if isinstance(value, float):
+        return round(value, 4) if math.isfinite(value) else None
+    if isinstance(value, list):
+        return [clean_json(v) for v in value]
+    return value
+
+
+class PlausibilityChecker:
+    """Warns (once per field) when live values fall outside what the field should hold.
+    That usually means the field sits at a different place in this game version."""
+
+    def __init__(self, patience=30):
+        self.patience, self.bad, self.warned = patience, {}, set()
+
+    def check(self, values, live):
+        if not live:
+            return
+        for f in FIELDS:
+            if f.lo is None or f.name in self.warned:
+                continue
+            v = values.get(f.name)
+            for x in (v if isinstance(v, list) else [v]):
+                if isinstance(x, (int, float)) and (not math.isfinite(x) or x < f.lo or x > f.hi):
+                    n = self.bad[f.name] = self.bad.get(f.name, 0) + 1
+                    if n >= self.patience:
+                        self.warned.add(f.name)
+                        log.warning("field %s looks wrong (%r, expected %s to %s): its position in the game's memory may differ",
+                                    f.name, v, f.lo, f.hi)
+                    break
+            else:
+                self.bad[f.name] = 0
+
+
+def core_values(t):
+    """The wheel-screen values, in the same names as the full telemetry (used for --simulate)."""
+    return {"gear": t.gear, "rpm": t.rpm, "rpm_percent": round(t.rpm_percent, 1), "speed_kmh": round(t.speed_kmh, 1),
+            "current_time_ms": t.current_ms, "last_time_ms": t.last_ms, "best_time_ms": t.best_ms,
+            "position": t.position, "num_cars": t.cars, "completed_laps": max(0, t.lap_current - 1),
+            "number_of_laps": t.lap_count}
+
+
+# --------------------------------------------------------------------------
+# Outputs for the telemetry (external monitor, other software, console)
+# --------------------------------------------------------------------------
+DASH_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Telemetry</title><style>
+:root{color-scheme:dark;--bg:#0f1115;--card:#1a1e26;--fg:#e8eaf0;--mut:#8b93a7;--ok:#4ade80}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px system-ui,sans-serif}
+header{display:flex;justify-content:space-between;padding:10px 16px;background:#141821}
+#status{color:var(--mut)}#status.live{color:var(--ok)}
+main{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px;padding:12px}
+.tile{background:var(--card);border-radius:10px;padding:10px 12px}
+.name{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.val{font-size:26px;font-variant-numeric:tabular-nums;margin-top:4px;word-break:break-word}
+.arr{display:grid;grid-template-columns:1fr 1fr;gap:2px 10px;font-size:18px}
+</style></head><body><header><b>Telemetry</b><span id="status">connecting...</span></header><main id="m"></main>
+<script>
+const m=document.getElementById('m'),st=document.getElementById('status');const tiles={};
+function fmt(v){return typeof v==='number'?(Number.isInteger(v)?v:v.toFixed(2)):(v===null?'-':String(v))}
+async function tick(){try{const r=await fetch('/data',{cache:'no-store'});const d=await r.json();
+st.textContent=d.live?'live':'waiting for the game';st.className=d.live?'live':'';
+for(const [k,v] of Object.entries(d.values)){let t=tiles[k];if(!t){t=tiles[k]=document.createElement('div');t.className='tile';
+t.innerHTML='<div class="name"></div><div class="val"></div>';t.firstChild.textContent=k.replace(/_/g,' ');m.appendChild(t)}
+const el=t.lastChild;if(Array.isArray(v)){el.className='val arr';el.innerHTML=v.map(x=>'<span>'+fmt(x)+'</span>').join('')}
+else{el.className='val';el.textContent=fmt(v)}}}catch(e){st.textContent='no connection';st.className=''}setTimeout(tick,100)}
+tick();
+</script></body></html>"""
+
+
+class UdpSink:
+    """Sends each update as one JSON datagram: {"t":..., "live":..., "values":{...}}."""
+
+    def __init__(self, host, port):
+        self.addr = (host, port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def update(self, values, live):
+        data = json.dumps({"t": round(time.time(), 3), "live": bool(live), "values": values},
+                          allow_nan=False, separators=(",", ":")).encode("utf-8")
+        if len(data) <= 65000:
+            self.sock.sendto(data, self.addr)
+        else:
+            log.warning("UDP update too large (%d bytes); select fewer fields", len(data))
+
+    def close(self):
+        self.sock.close()
+
+
+class Dashboard:
+    """A small web page served on this PC: open its address in a browser on any other screen."""
+
+    def __init__(self, host, port, names):
+        self.lock, self.latest = threading.Lock(), {"t": 0, "live": False, "values": {}}
+        catalog = [c for c in field_catalog() if c["name"] in set(names)]
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, body, ctype):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                try:
+                    path = self.path.split("?", 1)[0]
+                    if path == "/":
+                        self._send(200, DASH_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                    elif path == "/data":
+                        with owner.lock:
+                            body = json.dumps(owner.latest, allow_nan=False).encode("utf-8")
+                        self._send(200, body, "application/json")
+                    elif path == "/fields":
+                        self._send(200, json.dumps(catalog).encode("utf-8"), "application/json")
+                    else:
+                        self._send(404, b"not found", "text/plain")
+                except (BrokenPipeError, ConnectionError):
+                    pass
+
+        self.server = ThreadingHTTPServer((host, port), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def update(self, values, live):
+        with self.lock:
+            self.latest = {"t": round(time.time(), 3), "live": bool(live), "values": values}
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class ConsoleSink:
+    """Prints the selected values about once a second."""
+
+    def __init__(self, interval=1.0):
+        self.interval, self.next = interval, 0.0
+
+    def update(self, values, live):
+        now = time.monotonic()
+        if now >= self.next:
+            self.next = now + self.interval
+            print(("LIVE " if live else "idle ") + "  ".join("%s=%s" % (k, v) for k, v in values.items()))
+
+    def close(self):
+        pass
+
+
+class Publisher:
+    """Filters the full telemetry down to the selected fields and hands it to every output."""
+
+    def __init__(self, names, sinks):
+        self.names, self.sinks, self.failed = list(names), list(sinks), set()
+
+    def publish(self, values, live):
+        picked = {n: clean_json(values[n]) for n in self.names if n in values}
+        for sink in self.sinks:
+            try:
+                sink.update(picked, live)
+            except Exception as e:
+                if id(sink) not in self.failed:
+                    self.failed.add(id(sink))
+                    log.warning("%s output failed: %s", type(sink).__name__, e)
+
+    def close(self):
+        for sink in self.sinks:
+            try:
+                sink.close()
+            except Exception:
+                pass
+
+
+def parse_host_port(text, default_host="127.0.0.1"):
+    """'8080', ':8080' or 'host:8080' -> (host, port)."""
+    text = str(text).strip()
+    if ":" in text:
+        host, port = text.rsplit(":", 1)
+    else:
+        host, port = default_host, text
+    return (host or default_host), int(port)
+
+
 class StaleGuard:
     """AC leaves its shared memory mapped after the game exits, still saying 'live'.
     While live, the physics packet counter must keep changing; if it freezes the game is gone."""
@@ -167,6 +573,10 @@ class TelemetrySource:
     def read(self):
         raise NotImplementedError
 
+    def values(self):
+        """Every field of the last read() as a dict (names as in --list-fields)."""
+        return {}
+
     def close(self):
         pass
 
@@ -178,6 +588,7 @@ class AcReader(TelemetrySource):
         self.views = {}
         self.max_rpm = 0
         self.guard = StaleGuard()
+        self.pages = {}
         self._k32 = None
         if os.name == "nt":
             k = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -193,21 +604,42 @@ class AcReader(TelemetrySource):
     def open(self):
         if self._k32 is None:
             return False
-        for page, size in self.NAMES.items():
+        for page in self.NAMES:
             opened = None
             for prefix in ("Local\\", ""):
                 h = self._k32.OpenFileMappingW(4, 0, prefix + "acpmf_" + page)   # FILE_MAP_READ
                 if h:
-                    p = self._k32.MapViewOfFile(h, 4, 0, 0, size)
+                    p = self._k32.MapViewOfFile(h, 4, 0, 0, 0)     # 0 = map the whole section, whatever its size
                     if p:
-                        opened = (h, p, size)
-                        break
+                        size = self._region_size(p)
+                        if size > 0:
+                            opened = (h, p, min(size, 8192))
+                            break
+                        self._k32.UnmapViewOfFile(p)
                     self._k32.CloseHandle(h)
             if not opened:
                 self.close()
                 return False
             self.views[page] = opened
+        log.info("Mapped AC pages: %s", {k: v[2] for k, v in self.views.items()})
         return True
+
+    def _region_size(self, ptr):
+        class MBI(ctypes.Structure):
+            _fields_ = [("BaseAddress", ctypes.c_void_p), ("AllocationBase", ctypes.c_void_p),
+                        ("AllocationProtect", ctypes.c_uint32), ("PartitionId", ctypes.c_uint16),
+                        ("RegionSize", ctypes.c_size_t), ("State", ctypes.c_uint32),
+                        ("Protect", ctypes.c_uint32), ("Type", ctypes.c_uint32)]
+        mbi = MBI()
+        self._k32.VirtualQuery.argtypes = [ctypes.c_void_p, ctypes.POINTER(MBI), ctypes.c_size_t]
+        self._k32.VirtualQuery.restype = ctypes.c_size_t
+        return mbi.RegionSize if self._k32.VirtualQuery(ptr, ctypes.byref(mbi), ctypes.sizeof(mbi)) else 0
+
+    def values(self):
+        """Every field from the pages read by the last read(), plus gear and rpm_percent."""
+        v = decode_fields(self.pages)
+        add_derived(v, self.max_rpm)
+        return v
 
     def close(self):
         for h, p, _s in self.views.values():
@@ -220,6 +652,7 @@ class AcReader(TelemetrySource):
 
     def read(self):
         pages = {k: ctypes.string_at(p, s) for k, (h, p, s) in self.views.items()}
+        self.pages = pages
         t, self.max_rpm = parse_ac_pages(pages["physics"], pages["graphics"], pages["static"], self.max_rpm)
         status, = struct.unpack_from("<i", pages["graphics"], 4)
         packet_id, = struct.unpack_from("<i", pages["physics"], 0)
@@ -704,66 +1137,87 @@ def idle_frame():
     return Telemetry(live=False, gear="N")
 
 
-def run_follow(sender, rate, dry_run, reader):
+def run_follow(sender, rate, dry_run, reader, publisher=None):
+    """sender: wheel output or None; publisher: external outputs or None."""
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *a: stop.update(flag=True))
     period, connected, last_state, dead_since = 1.0 / rate, False, None, None
+    checker = PlausibilityChecker()
     log.info("Following Assetto Corsa at %.0f Hz. Press Ctrl+C to stop.", rate)
-    while not stop["flag"]:
-        t0 = time.monotonic()
-        if not connected:
-            connected = reader.open()
-            if connected:
-                log.info("Assetto Corsa shared memory found")
-            else:
-                time.sleep(1.0)
+    try:
+        while not stop["flag"]:
+            t0 = time.monotonic()
+            if not connected:
+                connected = reader.open()
+                if connected:
+                    log.info("Assetto Corsa shared memory found")
+                else:
+                    time.sleep(1.0)
+                    continue
+            try:
+                t = reader.read()
+                values = reader.values()
+            except Exception as e:
+                log.warning("lost Assetto Corsa: %s", e)
+                reader.close(); connected = False
+                if sender is not None:
+                    sender.send(idle_frame())
                 continue
-        try:
-            t = reader.read()
-        except Exception as e:
-            log.warning("lost Assetto Corsa: %s", e)
-            reader.close(); connected = False
-            sender.send(idle_frame())
-            continue
-        if t.live:
-            dead_since = None
-        else:
-            dead_since = dead_since or time.monotonic()
-            if time.monotonic() - dead_since > 10.0:
-                if sender.sdk is not None:
-                    sender.send(idle_frame())                          # leave the wheel screen tidy
-                    sender.close()                                     # re-init with the next game window
-                reader.close(); connected = False; dead_since = None   # re-open: AC may have restarted
-        frame = t if t.live else idle_frame()
-        state = (frame.live, frame.gear)
-        if state != last_state:
-            log.info("state: live=%s gear=%s", frame.live, frame.gear)
-            last_state = state
-        if dry_run:
-            print("gear=%s rpm=%d (%.1f%%) speed=%.1f cur=%d last=%d best=%d" % (
-                frame.gear, frame.rpm, frame.rpm_percent, frame.speed_kmh, frame.current_ms, frame.last_ms, frame.best_ms))
-        else:
-            sender.send(frame)
-        time.sleep(max(0.0, period - (time.monotonic() - t0)))
-    if sender.sdk is not None:                 # only reset the screen if we ever connected
-        sender.send(idle_frame())
-    sender.close()
-    reader.close()
+            checker.check(values, t.live)
+            if publisher is not None:
+                publisher.publish(values, t.live)
+            if t.live:
+                dead_since = None
+            else:
+                dead_since = dead_since or time.monotonic()
+                if time.monotonic() - dead_since > 10.0:
+                    if sender is not None and sender.sdk is not None:
+                        sender.send(idle_frame())                      # leave the wheel screen tidy
+                        sender.close()                                 # re-init with the next game window
+                    reader.close(); connected = False; dead_since = None   # re-open: AC may have restarted
+            frame = t if t.live else idle_frame()
+            state = (frame.live, frame.gear)
+            if state != last_state:
+                log.info("state: live=%s gear=%s", frame.live, frame.gear)
+                last_state = state
+            if dry_run:
+                print("gear=%s rpm=%d (%.1f%%) speed=%.1f cur=%d last=%d best=%d" % (
+                    frame.gear, frame.rpm, frame.rpm_percent, frame.speed_kmh, frame.current_ms, frame.last_ms, frame.best_ms))
+            if sender is not None:
+                sender.send(frame)
+            time.sleep(max(0.0, period - (time.monotonic() - t0)))
+    finally:
+        if sender is not None:
+            if sender.sdk is not None:                 # only reset the screen if we ever connected
+                sender.send(idle_frame())
+            sender.close()
+        if publisher is not None:
+            publisher.close()
+        reader.close()
 
 
-def run_simulate(sender, rate):
+def run_simulate(sender, rate, publisher=None):
+    """sender: wheel output or None; publisher: external outputs or None."""
     signal.signal(signal.SIGINT, signal.default_int_handler)
     t0 = time.monotonic()
-    log.info("Simulating telemetry. Watch the wheel screen. Ctrl+C to stop.")
+    log.info("Simulating telemetry. Ctrl+C to stop.")
     try:
         while True:
-            sender.send(simulate_frame(time.monotonic() - t0))
+            t = simulate_frame(time.monotonic() - t0)
+            if sender is not None:
+                sender.send(t)
+            if publisher is not None:
+                publisher.publish(core_values(t), True)
             time.sleep(1.0 / rate)
     except KeyboardInterrupt:
         pass
-    if sender.sdk is not None:                 # only reset the screen if we ever connected
-        sender.send(idle_frame())
-    sender.close()
+    finally:
+        if sender is not None:
+            if sender.sdk is not None:
+                sender.send(idle_frame())
+            sender.close()
+        if publisher is not None:
+            publisher.close()
 
 
 def run_list_devices(factory):
@@ -937,6 +1391,162 @@ def selftest():
             with self.assertRaises(RuntimeError):
                 pick_device([])
 
+        def _fake_pages(self):
+            pages = {k: bytearray(1024) for k in ("physics", "graphics", "static")}
+            for n, f in enumerate(FIELDS):
+                buf = pages[f.page]
+                if f.fmt.startswith("w"):
+                    txt = ("x%d" % n)[:f.size // 2 - 1]
+                    buf[f.offset:f.offset + f.size] = txt.encode("utf-16-le").ljust(f.size, b"\0")
+                elif f.fmt.endswith("i"):
+                    struct.pack_into("<i", buf, f.offset, n + 1)
+                else:
+                    for k in range(f.count):
+                        struct.pack_into("<f", buf, f.offset + 4 * k, n + k + 0.5)
+            return {k: bytes(v) for k, v in pages.items()}
+
+        def test_schema_is_consistent(self):
+            names = [f.name for f in FIELDS]
+            self.assertEqual(len(names), len(set(names)))
+            for page in ("physics", "graphics", "static"):
+                fs = sorted((f for f in FIELDS if f.page == page), key=lambda f: f.offset)
+                for a, b in zip(fs, fs[1:]):
+                    self.assertLessEqual(a.offset + a.size, b.offset, "%s overlaps %s" % (a.name, b.name))
+                for f in fs:
+                    self.assertEqual(f.offset % 2, 0)
+
+        def test_decode_roundtrip(self):
+            pages = self._fake_pages()
+            v = decode_fields(pages)
+            for n, f in enumerate(FIELDS):
+                if f.fmt.startswith("w"):
+                    self.assertEqual(v[f.name], ("x%d" % n)[:f.size // 2 - 1])
+                elif f.fmt.endswith("i"):
+                    self.assertEqual(v[f.name], n + 1)
+                elif f.count == 1:
+                    self.assertAlmostEqual(v[f.name], n + 0.5)
+                else:
+                    self.assertEqual(v[f.name], [n + k + 0.5 for k in range(f.count)])
+
+        def test_decode_short_page_gives_none(self):
+            v = decode_fields({"physics": bytes(40)})
+            self.assertEqual(v["rpm"], 0)
+            self.assertIsNone(v["tyre_pressure"])
+            self.assertIsNone(v["car_model"])
+
+        def test_add_derived(self):
+            v = {"gear_raw": 4, "rpm": 3500, "max_rpm": 7000}
+            self.assertEqual(add_derived(v, 0), 7000)
+            self.assertEqual((v["gear"], v["rpm_percent"]), ("3", 50.0))
+            v = {"gear_raw": 0, "rpm": 3000, "max_rpm": 0}
+            self.assertEqual(add_derived(v, 6000), 6000)                 # falls back to the last good value
+            self.assertEqual((v["gear"], v["rpm_percent"]), ("R", 50.0))
+            v = {"rpm": 1000}
+            add_derived(v, 0)
+            self.assertIsNone(v["gear"])
+            self.assertIsNone(v["rpm_percent"])
+
+        def test_select_fields(self):
+            core = select_fields("core")
+            self.assertEqual(core[:3], ["gear", "rpm", "rpm_percent"])
+            self.assertIn("tyre_pressure", select_fields("tyres"))
+            self.assertEqual(len(select_fields("all")), len(ALL_NAMES))
+            self.assertNotIn("fuel", select_fields("core,-fuel"))
+            self.assertEqual(select_fields("speed_kmh,rpm,speed_kmh"), ["speed_kmh", "rpm"])
+            self.assertNotIn("tyre_wear", select_fields("tyres,-tyre_wear"))
+            with self.assertRaises(ValueError) as cm:
+                select_fields("core,nonsense,tyrez")
+            self.assertIn("nonsense", str(cm.exception))
+            self.assertIn("tyrez", str(cm.exception))
+
+        def test_clean_json(self):
+            self.assertIsNone(clean_json(float("nan")))
+            self.assertIsNone(clean_json(float("inf")))
+            self.assertEqual(clean_json([1.234567, float("nan"), 3]), [1.2346, None, 3])
+            self.assertEqual(json.dumps(clean_json([float("nan")]), allow_nan=False), "[null]")
+
+        def test_plausibility_warns_once(self):
+            chk = PlausibilityChecker(patience=5)
+            bad = {"speed_kmh": 99999.0, "tyre_pressure": [26.0, 26.0, 26.0, 26.0]}
+            with self.assertLogs("t248", level="WARNING") as cm:
+                for _ in range(20):
+                    chk.check(bad, True)
+            self.assertEqual(len(cm.output), 1)
+            self.assertIn("speed_kmh", cm.output[0])
+            chk2 = PlausibilityChecker(patience=2)                       # not live: never warns
+            with self.assertNoLogs("t248", level="WARNING"):
+                for _ in range(10):
+                    chk2.check(bad, False)
+
+        def test_core_values_names_exist(self):
+            vals = core_values(simulate_frame(10.0))
+            for n in vals:
+                self.assertIn(n, ALL_NAMES)
+
+        def test_parse_host_port(self):
+            self.assertEqual(parse_host_port("8080"), ("127.0.0.1", 8080))
+            self.assertEqual(parse_host_port(":9000"), ("127.0.0.1", 9000))
+            self.assertEqual(parse_host_port("0.0.0.0:8080"), ("0.0.0.0", 8080))
+            self.assertEqual(parse_host_port("192.168.1.5:20777"), ("192.168.1.5", 20777))
+            with self.assertRaises(ValueError):
+                parse_host_port("abc")
+
+        def test_udp_sink_sends_json(self):
+            rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            rx.bind(("127.0.0.1", 0)); rx.settimeout(2.0)
+            sink = UdpSink("127.0.0.1", rx.getsockname()[1])
+            sink.update({"gear": "3", "tyre_pressure": [26.5, 26.5, 25.0, 25.0]}, True)
+            data, _ = rx.recvfrom(65535)
+            msg = json.loads(data)
+            self.assertTrue(msg["live"])
+            self.assertEqual(msg["values"]["gear"], "3")
+            self.assertEqual(msg["values"]["tyre_pressure"][2], 25.0)
+            sink.close(); rx.close()
+
+        def test_dashboard_serves_page_data_and_fields(self):
+            import urllib.request, urllib.error
+            dash = Dashboard("127.0.0.1", 0, ["gear", "rpm", "tyre_pressure"])
+            try:
+                base = "http://127.0.0.1:%d" % dash.port
+                html = urllib.request.urlopen(base + "/", timeout=3).read().decode()
+                self.assertIn("Telemetry", html)
+                d0 = json.loads(urllib.request.urlopen(base + "/data", timeout=3).read())
+                self.assertFalse(d0["live"])                                  # nothing published yet
+                dash.update({"gear": "2", "rpm": 4100}, True)
+                d1 = json.loads(urllib.request.urlopen(base + "/data", timeout=3).read())
+                self.assertTrue(d1["live"])
+                self.assertEqual(d1["values"], {"gear": "2", "rpm": 4100})
+                f = json.loads(urllib.request.urlopen(base + "/fields", timeout=3).read())
+                self.assertEqual({c["name"] for c in f}, {"gear", "rpm", "tyre_pressure"})
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(base + "/nope", timeout=3)
+                self.assertEqual(cm.exception.code, 404)
+            finally:
+                dash.close()
+
+        def test_dashboard_port_in_use_raises(self):
+            d1 = Dashboard("127.0.0.1", 0, ["gear"])
+            try:
+                with self.assertRaises(OSError):
+                    Dashboard("127.0.0.1", d1.port, ["gear"])
+            finally:
+                d1.close()
+
+        def test_publisher_filters_and_isolates_failures(self):
+            got = []
+            class Good:
+                def update(self, v, live): got.append((v, live))
+                def close(self): pass
+            class Bad:
+                def update(self, v, live): raise RuntimeError("boom")
+                def close(self): raise RuntimeError("boom")
+            pub = Publisher(["rpm", "tyre_pressure", "missing"], [Bad(), Good()])
+            pub.publish({"rpm": 5000, "gear": "2", "tyre_pressure": [1.0, float("nan"), 3.0, 4.0]}, True)
+            pub.publish({"rpm": 5100}, False)
+            self.assertEqual(got[0], ({"rpm": 5000, "tyre_pressure": [1.0, None, 3.0, 4.0]}, True))
+            self.assertEqual(got[1], ({"rpm": 5100}, False))
+            pub.close()                                                     # must not raise
+
         def test_sources_registry(self):
             self.assertIn("ac", SOURCES)
             self.assertTrue(issubclass(SOURCES["ac"], TelemetrySource))
@@ -1032,6 +1642,22 @@ def selftest():
 
 
 # --------------------------------------------------------------------------
+def print_field_list():
+    print("Selectable telemetry (use with --fields, e.g.  --fields core,tyres,-tyre_wear )\n")
+    print("Groups: all, " + ", ".join(sorted({c["group"] for c in field_catalog()})) + "")
+    print("  (core is a shortcut for: " + ", ".join(GROUP_EXTRA["core"]) + ")\n")
+    cur = None
+    for c in sorted(field_catalog(), key=lambda c: (c["group"], c["name"])):
+        if c["group"] != cur:
+            cur = c["group"]
+            print("[%s]" % cur)
+        arr = " x%d" % c["count"] if c["count"] > 1 else ""
+        print("  %-24s%-4s %s" % (c["name"], arr, c["desc"]))
+    print("\nArrays are ordered front-left, front-right, rear-left, rear-right.")
+    print("Default selection: core,lap")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Show Assetto Corsa telemetry on the T248 screen")
     ap.add_argument("--selftest", action="store_true", help="run the built-in logic tests and exit")
@@ -1048,6 +1674,15 @@ def main():
     ap.add_argument("--list-devices", action="store_true", help="show the Thrustmaster devices the SDK sees, and what each can do, then exit")
     ap.add_argument("--hwnd", help="window handle to give the SDK (e.g. 0x1A2B3C); default: the game window, or this console")
     ap.add_argument("--connect-timeout", type=float, default=8.0, help="seconds to wait for the SDK to find the wheel")
+    ap.add_argument("--list-fields", action="store_true", help="list every telemetry value you can select, then exit")
+    ap.add_argument("--fields", default="core,lap",
+                    help="what to send to the outputs below: names, groups or 'all'; '-name' removes one. "
+                         "Default 'core,lap'. Example: core,tyres,brakes,-tyre_wear")
+    ap.add_argument("--serve", metavar="[HOST:]PORT",
+                    help="serve a live web dashboard, e.g. 8080 (this PC only) or 0.0.0.0:8080 (other devices on your network)")
+    ap.add_argument("--udp", metavar="HOST:PORT", help="send each update as a JSON datagram to HOST:PORT")
+    ap.add_argument("--dump", action="store_true", help="print the selected values to the console about once a second")
+    ap.add_argument("--no-wheel", action="store_true", help="do not use the wheel at all (outputs above only)")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
 
@@ -1059,8 +1694,16 @@ def main():
 
     if a.selftest:
         return selftest()
-    if os.name == "nt" and struct.calcsize("P") != 8:
-        log.error("This needs 64-bit Python (the Thrustmaster SDK DLL is 64-bit).")
+    if a.list_fields:
+        return print_field_list()
+    try:
+        names = select_fields(a.fields)
+    except ValueError as e:
+        log.error("%s. Run with --list-fields to see the choices.", e)
+        return 2
+    wheel = not (a.no_wheel or a.dry_run)
+    if wheel and os.name == "nt" and struct.calcsize("P") != 8:
+        log.error("This needs 64-bit Python (the Thrustmaster SDK DLL is 64-bit). Use --no-wheel to skip the wheel.")
         return 2
 
     try:
@@ -1084,13 +1727,41 @@ def main():
 
     if a.list_devices:
         return run_list_devices(factory)
-    sender = Sender(factory, race_info=a.race_info)
+
+    sinks = []
+    try:
+        if a.serve:
+            host, port = parse_host_port(a.serve)
+            dash = Dashboard(host, port, names)
+            sinks.append(dash)
+            where = "this PC only" if host in ("127.0.0.1", "localhost") else "reachable from your network (no password!)"
+            log.info("Dashboard: http://%s:%d/  (%s)", "localhost" if host in ("0.0.0.0", "") else host, dash.port, where)
+        if a.udp:
+            host, port = parse_host_port(a.udp)
+            sinks.append(UdpSink(host, port))
+            log.info("Sending JSON to udp://%s:%d", host, port)
+    except (OSError, ValueError) as e:
+        log.error("could not start an output: %s", e)
+        for sk in sinks:
+            sk.close()
+        return 2
+    if a.dump:
+        sinks.append(ConsoleSink())
+    publisher = Publisher(names, sinks) if sinks else None
+    if publisher:
+        log.info("Selected %d value(s): %s", len(names), ", ".join(names[:12]) + (" ..." if len(names) > 12 else ""))
+
+    use_wheel = not (a.no_wheel or a.dry_run)
+    if not use_wheel and publisher is None and not a.dry_run:
+        log.error("--no-wheel with no output chosen: add --serve, --udp or --dump")
+        return 2
+    sender = Sender(factory, race_info=a.race_info) if use_wheel else None
     if a.probe:
-        return run_probe(sender, a.hold)
+        return run_probe(sender, a.hold) if sender else 2
     if a.simulate:
-        run_simulate(sender, a.rate)
+        run_simulate(sender, a.rate, publisher)
         return 0
-    run_follow(sender, a.rate, a.dry_run, SOURCES[a.game]())
+    run_follow(sender, a.rate, a.dry_run, SOURCES[a.game](), publisher)
     return 0
 
 
