@@ -31,6 +31,7 @@ Run --probe first and send back t248_bridge.log if anything fails.
 import argparse
 import ctypes
 import glob
+import json
 import logging
 import os
 import signal
@@ -81,6 +82,8 @@ class Telemetry:
     cars: int = 0
     lap_current: int = 0
     lap_count: int = 0
+    car: str = ""
+    track: str = ""
 
 
 def ac_gear_to_char(ac_gear):
@@ -100,6 +103,12 @@ def rpm_to_percent(rpm, max_rpm):
 
 # Offsets in AC's shared memory pages (SPageFilePhysics / Graphic / Static).
 PHYSICS_SIZE, GRAPHICS_SIZE, STATIC_SIZE = 800, 1600, 800
+
+
+def read_wstr(buf, offset, chars):
+    """A fixed-size UTF-16 string field, cut at the first NUL."""
+    raw = bytes(buf[offset:offset + chars * 2])
+    return raw.decode("utf-16-le", errors="ignore").split("\x00", 1)[0].strip()
 
 
 def parse_ac_pages(physics, graphics, static, max_rpm_cache):
@@ -129,6 +138,8 @@ def parse_ac_pages(physics, graphics, static, max_rpm_cache):
     t.cars = max(0, cars)
     t.lap_current = max(0, completed + 1)
     t.lap_count = max(0, laps)
+    t.car = read_wstr(static, 68, 33)
+    t.track = read_wstr(static, 134, 33)
     return t, max_rpm
 
 
@@ -136,6 +147,65 @@ def parse_ac_pages(physics, graphics, static, max_rpm_cache):
 # Shared memory reader (Windows). Opens the EXISTING mapping read-only, so it
 # can never create a mapping that would interfere with the game.
 # --------------------------------------------------------------------------
+MIN_LAP_MS, MAX_LAP_MS = 10_000, 3_600_000
+
+
+class BestTracker:
+    """Keeps the player's best lap per car+track itself, because AC's own 'best lap' value is
+    session-based and not reliable online. Persisted as a small JSON file."""
+
+    def __init__(self, path=None):
+        self.path, self.bests, self.key, self.prev_last = path, {}, None, None
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.bests = {k: int(v) for k, v in data.items() if isinstance(v, (int, float)) and v > 0}
+            except FileNotFoundError:
+                pass
+            except (ValueError, OSError, AttributeError) as e:
+                log.warning("ignoring unreadable best-lap file %s (%s)", path, e)
+
+    def observe(self, key, last_ms):
+        """Call every frame with the game's 'last lap' time. A change to a new value means a lap just finished."""
+        if not key or key == "|":
+            return
+        if key != self.key:                                   # new car/track: just learn the current value
+            self.key, self.prev_last = key, last_ms
+            return
+        if last_ms == self.prev_last:
+            return
+        self.prev_last = last_ms
+        if MIN_LAP_MS <= last_ms <= MAX_LAP_MS and last_ms < self.bests.get(key, MAX_LAP_MS + 1):
+            self.bests[key] = last_ms
+            log.info("new best lap for %s: %d ms", key, last_ms)
+            self._save()
+
+    def best(self, key):
+        return self.bests.get(key, 0)
+
+    def _save(self):
+        if not self.path:
+            return
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.bests, f, indent=1)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            log.warning("could not save best laps: %s", e)
+
+
+def choose_best(mode, tracked_ms, game_ms):
+    """mode: 'game' (AC's value), 'tracked' (our own), 'both' (the lower of the two) or 'off'."""
+    cands = []
+    if mode in ("tracked", "both") and tracked_ms > 0:
+        cands.append(tracked_ms)
+    if mode in ("game", "both") and game_ms > 0:
+        cands.append(game_ms)
+    return min(cands) if cands else 0
+
+
 class StaleGuard:
     """AC leaves its shared memory mapped after the game exits, still saying 'live'.
     While live, the physics packet counter must keep changing; if it freezes the game is gone."""
@@ -159,9 +229,10 @@ class StaleGuard:
 class AcReader:
     NAMES = {"physics": PHYSICS_SIZE, "graphics": GRAPHICS_SIZE, "static": STATIC_SIZE}
 
-    def __init__(self):
+    def __init__(self, best_mode="both", tracker=None):
         self.views = {}
         self.max_rpm = 0
+        self.best_mode, self.tracker = best_mode, tracker or BestTracker(None)
         self.guard = StaleGuard()
         self._k32 = None
         if os.name == "nt":
@@ -210,6 +281,11 @@ class AcReader:
         packet_id, = struct.unpack_from("<i", pages["physics"], 0)
         if not self.guard.is_live(packet_id, status, time.monotonic()):
             t.live = False
+        if t.live:
+            key = t.car + "|" + t.track
+            if self.best_mode in ("tracked", "both"):
+                self.tracker.observe(key, t.last_ms)
+            t.best_ms = choose_best(self.best_mode, self.tracker.best(key), t.best_ms)
         return t
 
 
@@ -617,8 +693,8 @@ def idle_frame():
     return Telemetry(live=False, gear="N")
 
 
-def run_follow(sender, rate, dry_run):
-    reader = AcReader()
+def run_follow(sender, rate, dry_run, reader=None):
+    reader = reader or AcReader()
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *a: stop.update(flag=True))
     period, connected, last_state, dead_since = 1.0 / rate, False, None, None
@@ -803,6 +879,51 @@ def selftest():
             self.assertEqual(len(attempts), 3)
             self.assertIsNone(s.sdk)
 
+        def test_names_parsed(self):
+            ph, gr, st = pages()
+            st = bytearray(st)
+            st[68:68 + 66] = "ks_porsche_911".encode("utf-16-le").ljust(66, b"\0")
+            st[134:134 + 66] = "monza".encode("utf-16-le").ljust(66, b"\0")
+            t, _ = parse_ac_pages(ph, gr, bytes(st), 0)
+            self.assertEqual((t.car, t.track), ("ks_porsche_911", "monza"))
+
+        def test_best_tracker_records_and_ignores(self):
+            import tempfile
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "b.json")
+                bt = BestTracker(path)
+                k = "car|track"
+                bt.observe(k, 80_000)                  # first sight of the car/track: only learn it, not a new lap
+                self.assertEqual(bt.best(k), 0)
+                bt.observe(k, 95_000)                  # a lap finished
+                bt.observe(k, 95_000)                  # same value: no new lap
+                bt.observe(k, 91_500)                  # better lap
+                bt.observe(k, 99_000)                  # slower lap does not replace it
+                bt.observe(k, 3_000)                   # nonsense (too short) is ignored
+                bt.observe(k, 0)                       # lap counter reset
+                self.assertEqual(bt.best(k), 91_500)
+                self.assertEqual(BestTracker(path).best(k), 91_500)            # survives a restart
+                bt.observe("other|track", 70_000); bt.observe("other|track", 71_000)
+                self.assertEqual(bt.best("other|track"), 71_000)
+                self.assertEqual(bt.best(k), 91_500)                            # kept per car+track
+
+        def test_best_tracker_tolerates_bad_file(self):
+            import tempfile
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "b.json")
+                open(path, "w").write("{not json")
+                self.assertEqual(BestTracker(path).best("x|y"), 0)
+                open(path, "w").write("[1,2,3]")
+                self.assertEqual(BestTracker(path).best("x|y"), 0)
+
+        def test_choose_best(self):
+            self.assertEqual(choose_best("both", 91_000, 90_000), 90_000)
+            self.assertEqual(choose_best("both", 91_000, 0), 91_000)
+            self.assertEqual(choose_best("tracked", 91_000, 80_000), 91_000)
+            self.assertEqual(choose_best("game", 91_000, 80_000), 80_000)
+            self.assertEqual(choose_best("off", 91_000, 80_000), 0)
+            self.assertEqual(choose_best("both", 0, 0), 0)
+
         def test_init_block_layout(self):
             b = build_init_block(0x1A2B3C)
             self.assertEqual(len(b), 12)
@@ -906,6 +1027,10 @@ def main():
     ap.add_argument("--device", type=int, default=0, help="SDK device index (default 0)")
     ap.add_argument("--hwnd", help="window handle to give the SDK (e.g. 0x1A2B3C); default: the game window, or this console")
     ap.add_argument("--connect-timeout", type=float, default=8.0, help="seconds to wait for the SDK to find the wheel")
+    ap.add_argument("--best", choices=("both", "tracked", "game", "off"), default="both",
+                    help="best-lap source: tracked = kept by this script per car+track, game = Assetto Corsa's own value, "
+                         "both = the lower of the two (default), off = never send a best lap")
+    ap.add_argument("--reset-best", action="store_true", help="forget all saved best laps and exit")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
 
@@ -917,6 +1042,14 @@ def main():
 
     if a.selftest:
         return selftest()
+    bests_path = os.path.join(here, "t248_bests.json")
+    if a.reset_best:
+        try:
+            os.remove(bests_path)
+            print("Saved best laps deleted.")
+        except FileNotFoundError:
+            print("No saved best laps.")
+        return 0
     if os.name == "nt" and struct.calcsize("P") != 8:
         log.error("This needs 64-bit Python (the Thrustmaster SDK DLL is 64-bit).")
         return 2
@@ -941,7 +1074,7 @@ def main():
     if a.simulate:
         run_simulate(sender, a.rate)
         return 0
-    run_follow(sender, a.rate, a.dry_run)
+    run_follow(sender, a.rate, a.dry_run, AcReader(a.best, BestTracker(bests_path)))
     return 0
 
 
