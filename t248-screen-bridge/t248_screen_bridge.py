@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import math
+import re
 import signal
 import socket
 import struct
@@ -74,6 +75,8 @@ ID_POSITION = 0x31      # race position                          (probable)
 ID_CARS = 0x32          # number of drivers                      (confirmed)
 ID_LAP_CURRENT = 0x33   # current lap number                     (probable)
 ID_LAP_COUNT = 0x34     # total laps                             (confirmed)
+ID_POWER = 0x49         # screen power state, 0..2: the test app steps 0,1,2,1,0 (meaning inferred, see --power-test)
+POWER_STANDBY, POWER_WAKING, POWER_AWAKE = 0, 1, 2
 
 log = logging.getLogger("t248")
 
@@ -543,6 +546,33 @@ def parse_host_port(text, default_host="127.0.0.1"):
     return (host or default_host), int(port)
 
 
+class GearFilter:
+    """AC passes through neutral for about 0.1 s on every shift. Keep showing the previous gear until
+    neutral has lasted `delay` seconds, so the wheel screen does not flash N between gears."""
+
+    def __init__(self, delay=0.4):
+        self.delay, self.shown, self.neutral_since = delay, None, None
+
+    def reset(self):
+        self.shown, self.neutral_since = None, None
+
+    def update(self, gear, now):
+        if self.delay <= 0 or gear != "N" or self.shown in (None, "N"):
+            self.shown, self.neutral_since = gear, None
+            return gear
+        if self.neutral_since is None:
+            self.neutral_since = now
+        if now - self.neutral_since >= self.delay:
+            self.shown, self.neutral_since = "N", None
+            return "N"
+        return self.shown
+
+
+def should_recycle(not_live_for, game_running, limit=10.0):
+    """Drop and re-open the game connection only when the game itself is gone, not when it sits in a menu."""
+    return not_live_for > limit and not game_running
+
+
 class StaleGuard:
     """AC leaves its shared memory mapped after the game exits, still saying 'live'.
     While live, the physics packet counter must keep changing; if it freezes the game is gone."""
@@ -584,10 +614,12 @@ class TelemetrySource:
 class AcReader(TelemetrySource):
     NAMES = {"physics": PHYSICS_SIZE, "graphics": GRAPHICS_SIZE, "static": STATIC_SIZE}
 
-    def __init__(self):
+    def __init__(self, neutral_delay=0.4):
         self.views = {}
         self.max_rpm = 0
         self.guard = StaleGuard()
+        self.gears = GearFilter(neutral_delay)
+        self.shown_gear = None
         self.pages = {}
         self._k32 = None
         if os.name == "nt":
@@ -639,6 +671,8 @@ class AcReader(TelemetrySource):
         """Every field from the pages read by the last read(), plus gear and rpm_percent."""
         v = decode_fields(self.pages)
         add_derived(v, self.max_rpm)
+        if self.shown_gear is not None:
+            v["gear"] = self.shown_gear                  # the steadied gear; gear_raw stays untouched
         return v
 
     def close(self):
@@ -656,8 +690,15 @@ class AcReader(TelemetrySource):
         t, self.max_rpm = parse_ac_pages(pages["physics"], pages["graphics"], pages["static"], self.max_rpm)
         status, = struct.unpack_from("<i", pages["graphics"], 4)
         packet_id, = struct.unpack_from("<i", pages["physics"], 0)
-        if not self.guard.is_live(packet_id, status, time.monotonic()):
+        now = time.monotonic()
+        if not self.guard.is_live(packet_id, status, now):
             t.live = False
+        if t.live:
+            t.gear = self.gears.update(t.gear, now)
+            self.shown_gear = t.gear
+        else:
+            self.gears.reset()
+            self.shown_gear = None
         return t
 
 
@@ -820,6 +861,9 @@ def foreground_window():
     return u.GetForegroundWindow() or 0
 
 
+SDK_WINDOW = {"kind": None}      # what the current SDK session was given as its window
+
+
 def resolve_hwnd(mode, explicit=None):
     """mode: 'game' (Assetto Corsa's window, fall back to console), 'console', or explicit handle."""
     if explicit:
@@ -835,20 +879,39 @@ def resolve_hwnd(mode, explicit=None):
 INFO_SIZE = 0x648       # size of the device-info structure; its first DWORD must hold this value
 
 
+THRUSTMASTER_VID = 0x044F
+KNOWN_MODELS = {0xB696: "T248"}      # only models seen in real captures; unknown ones are shown by id
+
+
 def parse_device_info(raw):
-    """Decode the structure filled in by tm_api_get_device_info (layout taken from the SDK test app)."""
+    """Decode the structure filled in by tm_api_get_device_info.
+    Layout traced from the SDK test app: the device path at +0x210, then the capability block at the
+    end of the 0x648-byte structure."""
     if len(raw) < INFO_SIZE:
         raise ValueError("device info too short")
-    axes_mask, = struct.unpack_from("<I", raw, 0x08)
+    path = raw[0x210:0x210 + 0x104 * 2].decode("utf-16-le", errors="ignore").split("\x00", 1)[0].strip()
+    axes_mask, = struct.unpack_from("<I", raw, 0x62C)
     axes, buttons, analog, povs, encoders, vec4, motors, fslots, audio, leds, screens = \
-        struct.unpack_from("<11H", raw, 0x0C)
-    name = raw[0x210:0x210 + 0x104 * 2].decode("utf-16-le", errors="ignore").split("\x00", 1)[0].strip()
-    return {"name": name or "(unnamed)", "axes": axes, "axes_mask": axes_mask, "buttons": buttons,
-            "analog_buttons": analog, "povs": povs, "encoders": encoders, "vec4": vec4,
-            "motors": motors, "force_slots": fslots, "audio": audio, "leds": leds, "screens": screens}
+        struct.unpack_from("<11H", raw, 0x630)
+    caps = (axes, buttons, analog, povs, encoders, vec4, motors, fslots, audio, leds, screens)
+    m = re.search(r"vid_([0-9a-f]{4})&pid_([0-9a-f]{4})", path, re.I)
+    vid, pid = (int(m.group(1), 16), int(m.group(2), 16)) if m else (None, None)
+    if vid == THRUSTMASTER_VID and pid in KNOWN_MODELS:
+        name = "Thrustmaster " + KNOWN_MODELS[pid]
+    elif vid is not None:
+        name = "device %04X:%04X" % (vid, pid)
+    else:
+        name = path or "(unnamed)"
+    return {"name": name, "path": path, "vid": vid, "pid": pid,
+            "caps_ok": all(c <= 64 for c in caps),         # absurd counts mean the layout was misread
+            "axes": axes, "axes_mask": axes_mask, "buttons": buttons, "analog_buttons": analog,
+            "povs": povs, "encoders": encoders, "vec4": vec4, "motors": motors, "force_slots": fslots,
+            "audio": audio, "leds": leds, "screens": screens}
 
 
 def describe_device(i, info):
+    if not info.get("caps_ok", True):
+        return "#%d %s | capabilities unreadable (layout mismatch)" % (i, info["name"])
     return ("#%d %s | screens=%d leds=%d motors=%d force_slots=%d audio=%d | axes=%d buttons=%d povs=%d"
             % (i, info["name"], info["screens"], info["leds"], info["motors"], info["force_slots"],
                info["audio"], info["axes"], info["buttons"], info["povs"]))
@@ -863,12 +926,16 @@ def pick_device(infos, requested=None):
         if not 0 <= requested < len(infos):
             raise RuntimeError("device %d does not exist (the SDK reports %d device(s))" % (requested, len(infos)))
         return requested, "chosen with --device"
-    for i, inf in enumerate(infos):
-        if inf["screens"] > 0:
+    reliable = [i for i, inf in enumerate(infos) if inf.get("caps_ok", True)]
+    for i in reliable:
+        if infos[i]["screens"] > 0:
             return i, "first device with a screen"
-    for i, inf in enumerate(infos):
-        if inf["leds"] > 0:
+    for i in reliable:
+        if infos[i]["leds"] > 0:
             return i, "no screen found; first device with LEDs"
+    for i, inf in enumerate(infos):
+        if inf.get("vid") == THRUSTMASTER_VID:
+            return i, "capabilities not readable; first Thrustmaster device"
     return 0, "no screen or LEDs reported; using device 0"
 
 
@@ -935,22 +1002,29 @@ class TmSdk:
             rc = call_sdk("tm_api_get_device_info", self.dll.tm_api_get_device_info, i, ctypes.addressof(buf))
             if rc != 0:
                 log.warning("tm_api_get_device_info(%d) -> rc=%s", i, rc)
-                infos.append({"name": "(unknown)", "screens": 0, "leds": 0, "motors": 0, "force_slots": 0,
+                infos.append({"name": "(unknown)", "path": "", "vid": None, "pid": None, "caps_ok": False,
+                              "screens": 0, "leds": 0, "motors": 0, "force_slots": 0,
                               "audio": 0, "axes": 0, "buttons": 0, "povs": 0})
                 continue
             info = parse_device_info(buf.raw)
+            log.debug("device %d capability block: %s", i, buf.raw[0x62C:INFO_SIZE].hex())
             infos.append(info)
             log.info("device %s", describe_device(i, info))
         return infos
 
-    def connect(self, device_index=None, hwnd=0, timeout=8.0):
-        """device_index None = choose automatically (a device with a screen first)."""
+    def connect(self, device_index=None, hwnd=0, timeout=8.0, enumerate_devices=True):
+        """device_index None = choose automatically (a device with a screen first).
+        enumerate_devices=False skips tm_api_get_device_info and opens the device directly."""
         n = self.start(hwnd, timeout)
-        infos = self.enumerate(n)
-        idx, why = pick_device(infos, device_index)
-        log.info("Driving device #%d (%s): %s", idx, infos[idx]["name"], why)
-        if infos[idx]["screens"] == 0:
-            log.warning("This device reports no screen; LEDs or nothing may respond")
+        if enumerate_devices:
+            infos = self.enumerate(n)
+            idx, why = pick_device(infos, device_index)
+            log.info("Driving device #%d (%s): %s", idx, infos[idx]["name"], why)
+            if infos[idx].get("caps_ok", True) and infos[idx]["screens"] == 0:
+                log.warning("This device reports no screen; LEDs or nothing may respond")
+        else:
+            idx = device_index or 0
+            log.info("Not enumerating devices (--no-enumerate); opening device #%d", idx)
         h = ctypes.c_int(0)
         rc = call_sdk("tm_api_open_device", self.dll.tm_api_open_device, idx, ctypes.byref(h))
         log.info("tm_api_open_device(%s) -> rc=%s handle=0x%x (foreground window now 0x%x)",
@@ -1000,7 +1074,7 @@ class FakeSdk:
     def __init__(self, fail_after=None):
         self.calls, self.connected, self.closed, self.fail_after = [], 0, 0, fail_after
 
-    def connect(self, device_index=None, hwnd=0, timeout=0):
+    def connect(self, device_index=None, hwnd=0, timeout=0, enumerate_devices=True):
         self.connected += 1
 
     def set_prop(self, pid, ptype, value):
@@ -1033,6 +1107,28 @@ class Sender:
         self.fails = 0
         self.rc_seen = {}
         self.next_try, self.backoff, self.last_error = 0.0, 1.0, None
+        self.asleep = False
+
+    def sleep(self):
+        """Put the wheel screen into standby and let go of the SDK. Safe to call more than once."""
+        if self.asleep:
+            return
+        self.asleep = True
+        if self.sdk is not None:
+            try:
+                self.sdk.set_prop(ID_POWER, TYPE_INT, POWER_STANDBY)
+                self.sdk.update()
+            except Exception as e:
+                log.debug("standby send failed: %s", e)
+            self.close()                        # the USB link is about to drop; reconnect after waking
+        log.info("Wheel screen: standby")
+
+    def wake(self):
+        if not self.asleep:
+            return
+        self.asleep = False
+        self.next_try, self.backoff = 0.0, 1.0   # reconnect at once; back-off covers a slow USB resume
+        log.info("Wheel screen: waking up")
 
     def _ensure(self, now):
         if self.sdk is None:
@@ -1055,6 +1151,7 @@ class Sender:
             self.backoff, self.last_error = 1.0, None
             log.info("SDK connected")
 
+
     def _send(self, pid, ptype, value, now, eps=0.0):
         prev = self.last.get(pid)
         if prev is not None:
@@ -1072,10 +1169,13 @@ class Sender:
         return False
 
     def send(self, t, now=None):
+        if self.asleep:
+            return
         now = time.monotonic() if now is None else now
         try:
             self._ensure(now)
             ok = True
+            ok &= self._send(ID_POWER, TYPE_INT, POWER_AWAKE, now)       # re-asserted every second: recovers a screen that dropped to standby
             ok &= self._send(ID_GEAR, TYPE_INT, ord(t.gear[0]), now)
             ok &= self._send(ID_RPM, TYPE_INT, t.rpm, now)
             ok &= self._send(ID_RPM_PERCENT, TYPE_DOUBLE, round(t.rpm_percent, 1), now, eps=0.05)
@@ -1137,7 +1237,160 @@ def idle_frame():
     return Telemetry(live=False, gear="N")
 
 
-def run_follow(sender, rate, dry_run, reader, publisher=None):
+# --------------------------------------------------------------------------
+# Follow the computer's power state (sleep / resume / display off / shutdown)
+# --------------------------------------------------------------------------
+WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_ENDSESSION = 0x218, 0x11, 0x16
+PBT_APMSUSPEND, PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE = 4, 7, 18, 0x8013
+GUID_CONSOLE_DISPLAY_STATE = "6fe69556-704a-47a0-8f24-c28d936fda47"     # data: 0 off, 1 on, 2 dimmed
+
+
+class PowerState:
+    """Pure state machine (no Windows calls) so it can be tested anywhere."""
+
+    def __init__(self, follow_display=True):
+        self.suspended = self.ending = False
+        self.display_on = True
+        self.follow_display = follow_display
+
+    @property
+    def standby(self):
+        return self.suspended or self.ending or (self.follow_display and not self.display_on)
+
+    def on_event(self, msg, wparam=0, setting_guid=None, data=None):
+        if msg == WM_POWERBROADCAST:
+            if wparam == PBT_APMSUSPEND:
+                self.suspended = True
+            elif wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
+                self.suspended = False
+                self.display_on = True          # a missed "display on" message must not leave the screen in standby
+            elif wparam == PBT_POWERSETTINGCHANGE and setting_guid == GUID_CONSOLE_DISPLAY_STATE and data is not None:
+                self.display_on = data != 0
+        elif msg == WM_QUERYENDSESSION:
+            self.ending = True
+        elif msg == WM_ENDSESSION and wparam == 0:
+            self.ending = False                     # shutdown was cancelled
+
+
+class PowerWatcher:
+    """Listens for Windows power messages on a hidden window in its own thread."""
+
+    def __init__(self, follow_display=True):
+        self.state = PowerState(follow_display)
+        self.ok = False
+        if os.name == "nt":
+            import threading
+            self._ready = threading.Event()
+            threading.Thread(target=self._run, name="power-watcher", daemon=True).start()
+            self._ready.wait(3.0)
+
+    @property
+    def standby(self):
+        return self.state.standby
+
+    def _run(self):
+        try:
+            from ctypes import wintypes
+            u, k = ctypes.WinDLL("user32", use_last_error=True), ctypes.WinDLL("kernel32")
+            LRESULT = ctypes.c_ssize_t
+            WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM)
+
+            class WNDCLASS(ctypes.Structure):
+                _fields_ = [("style", ctypes.c_uint), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                            ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HANDLE),
+                            ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HANDLE),
+                            ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+            u.DefWindowProcW.restype = LRESULT
+            u.DefWindowProcW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+            u.CreateWindowExW.restype = wintypes.HWND
+            u.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                          ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                          wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+            u.RegisterPowerSettingNotification.restype = wintypes.HANDLE
+            u.RegisterPowerSettingNotification.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            k.GetModuleHandleW.restype = wintypes.HINSTANCE
+
+            def proc(hwnd, msg, wparam, lparam):
+                try:
+                    guid = data = None
+                    if msg == WM_POWERBROADCAST and wparam == PBT_POWERSETTINGCHANGE and lparam:
+                        raw = ctypes.string_at(lparam, 24)          # GUID, DWORD length, first data bytes
+                        guid = str(__import__("uuid").UUID(bytes_le=raw[:16]))
+                        data = raw[20]
+                    before = self.state.standby
+                    if msg in (WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_ENDSESSION):
+                        log.info("Power event: msg=0x%x wparam=0x%x%s", msg, int(wparam),
+                                 "" if guid is None else " setting=%s data=%s" % (guid, data))
+                    self.state.on_event(msg, int(wparam), guid, data)
+                    if self.state.standby != before:
+                        log.info("Power state changed: %s", "standby" if self.state.standby else "active")
+                    if msg == WM_QUERYENDSESSION:
+                        return 1                                    # do not block the shutdown
+                except Exception as e:
+                    log.debug("power message error: %s", e)
+                return u.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+            self._proc = WNDPROC(proc)                              # keep a reference alive
+            cls = WNDCLASS()
+            cls.lpfnWndProc, cls.hInstance, cls.lpszClassName = self._proc, k.GetModuleHandleW(None), "T248BridgePower"
+            u.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASS)]
+            u.RegisterClassW(ctypes.byref(cls))
+            # a hidden top-level window: message-only windows do not receive power broadcasts
+            hwnd = u.CreateWindowExW(0, "T248BridgePower", "T248 bridge power", 0, 0, 0, 0, 0, None, None, cls.hInstance, None)
+            guid_bytes = (ctypes.c_ubyte * 16).from_buffer_copy(__import__("uuid").UUID(GUID_CONSOLE_DISPLAY_STATE).bytes_le)
+            u.RegisterPowerSettingNotification(hwnd, ctypes.byref(guid_bytes), 0)
+            self.ok = bool(hwnd)
+            if not self.ok:
+                log.warning("could not create the power-watching window; the screen will not follow standby")
+            self._ready.set()
+            msg = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                u.TranslateMessage(ctypes.byref(msg)); u.DispatchMessageW(ctypes.byref(msg))
+        except Exception as e:
+            log.warning("power watching unavailable: %s", e)
+            self._ready.set()
+
+
+def follow_power(sender, watcher):
+    """Called every loop: put the wheel to sleep or wake it to match the computer."""
+    if sender is None or watcher is None:
+        return
+    if watcher.standby:
+        sender.sleep()
+    else:
+        sender.wake()
+
+
+_CTRL_HANDLER = []        # keeps the Windows callback alive for the life of the process
+
+
+def install_cleanup(callback, on_shutdown=None):
+    """Run callback when the program exits for any reason, including closing the console window,
+    so the SDK session is not left half open (which can leave the wheel screen unresponsive)."""
+    import atexit
+    atexit.register(callback)
+    if os.name == "nt":
+        try:
+            k = ctypes.WinDLL("kernel32")
+            routine = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+            def handler(event):                  # 2 close window, 5 log off, 6 shutdown
+                if event in (2, 5, 6):
+                    try:
+                        if event in (5, 6) and on_shutdown:
+                            on_shutdown()                  # log off / shutdown: put the screen to standby first
+                        callback()
+                    except Exception:
+                        pass
+                return 0                         # let the normal handling carry on
+            _CTRL_HANDLER.append(routine(handler))
+            k.SetConsoleCtrlHandler(_CTRL_HANDLER[-1], True)
+        except Exception as e:
+            log.debug("could not install console handler: %s", e)
+
+
+def run_follow(sender, rate, dry_run, reader, publisher=None, power=None):
     """sender: wheel output or None; publisher: external outputs or None."""
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *a: stop.update(flag=True))
@@ -1147,6 +1400,7 @@ def run_follow(sender, rate, dry_run, reader, publisher=None):
     try:
         while not stop["flag"]:
             t0 = time.monotonic()
+            follow_power(sender, power)
             if not connected:
                 connected = reader.open()
                 if connected:
@@ -1170,11 +1424,15 @@ def run_follow(sender, rate, dry_run, reader, publisher=None):
                 dead_since = None
             else:
                 dead_since = dead_since or time.monotonic()
-                if time.monotonic() - dead_since > 10.0:
-                    if sender is not None and sender.sdk is not None:
-                        sender.send(idle_frame())                      # leave the wheel screen tidy
-                        sender.close()                                 # re-init with the next game window
-                    reader.close(); connected = False; dead_since = None   # re-open: AC may have restarted
+                waited = time.monotonic() - dead_since
+                if waited > 10.0:
+                    if should_recycle(waited, bool(find_game_window())):
+                        if (sender is not None and sender.sdk is not None
+                                and SDK_WINDOW["kind"] == "Assetto Corsa window"):   # a console-window session has nothing to refresh
+                            sender.send(idle_frame())                  # leave the wheel screen tidy
+                            sender.close()                             # re-init with the next game window
+                        reader.close(); connected = False              # the game has gone: look for it again
+                    dead_since = time.monotonic()                      # in a menu: check again in 10 s
             frame = t if t.live else idle_frame()
             state = (frame.live, frame.gear)
             if state != last_state:
@@ -1196,7 +1454,7 @@ def run_follow(sender, rate, dry_run, reader, publisher=None):
         reader.close()
 
 
-def run_simulate(sender, rate, publisher=None):
+def run_simulate(sender, rate, publisher=None, power=None):
     """sender: wheel output or None; publisher: external outputs or None."""
     signal.signal(signal.SIGINT, signal.default_int_handler)
     t0 = time.monotonic()
@@ -1204,6 +1462,7 @@ def run_simulate(sender, rate, publisher=None):
     try:
         while True:
             t = simulate_frame(time.monotonic() - t0)
+            follow_power(sender, power)
             if sender is not None:
                 sender.send(t)
             if publisher is not None:
@@ -1237,6 +1496,29 @@ def run_list_devices(factory):
         return 1
     finally:
         sdk.close()
+
+
+def run_power_test(sender, step=4.0):
+    """Walk the power record through its three values so the person can note what the screen does."""
+    log.info("POWER TEST: showing a test frame, then power state 0, 1, 2, 1, 0 (%.0f s each). Watch the screen.", step)
+    frame = simulate_frame(10.0)
+    try:
+        for value in (POWER_AWAKE, POWER_STANDBY, POWER_WAKING, POWER_AWAKE, POWER_WAKING, POWER_STANDBY, POWER_AWAKE):
+            sender.send(frame)
+            if sender.sdk is None:
+                log.error("POWER TEST: could not connect to the wheel")
+                return 1
+            rc = sender.sdk.set_prop(ID_POWER, TYPE_INT, value)
+            sender.sdk.update()
+            log.info("POWER TEST: state %d sent (rc=%s)", value, rc)
+            print("power state %d  (0 = standby guess, 2 = awake guess)" % value)
+            end = time.monotonic() + step
+            while time.monotonic() < end:
+                sender.send(frame)
+                time.sleep(0.1)
+    finally:
+        sender.close()
+    return 0
 
 
 def run_probe(sender, hold=8.0):
@@ -1322,7 +1604,7 @@ def selftest():
             t = Telemetry(live=True, gear="2", rpm=3000, rpm_percent=40.0, speed_kmh=50.0, current_ms=1000)
             s.send(t, now=0.0)
             ids = {c[0] for c in fake.calls}
-            self.assertEqual(ids, {ID_GEAR, ID_RPM, ID_RPM_PERCENT, ID_SPEED, ID_CURRENT_LAP})
+            self.assertEqual(ids - {ID_POWER}, {ID_GEAR, ID_RPM, ID_RPM_PERCENT, ID_SPEED, ID_CURRENT_LAP})   # POWER = wake-up sent once on connect
             n = len(fake.calls)
             s.send(t, now=0.1)                                   # unchanged and recent: nothing new
             self.assertEqual(len(fake.calls), n)
@@ -1334,6 +1616,44 @@ def selftest():
             s.send(Telemetry(live=True, position=3, cars=12, lap_current=2, lap_count=5), now=0.0)
             ids = {c[0] for c in fake.calls}
             self.assertTrue({ID_POSITION, ID_CARS, ID_LAP_CURRENT, ID_LAP_COUNT} <= ids)
+
+        def test_power_state_machine(self):
+            ps = PowerState()
+            self.assertFalse(ps.standby)
+            ps.on_event(WM_POWERBROADCAST, PBT_APMSUSPEND); self.assertTrue(ps.standby)
+            ps.on_event(WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC); self.assertFalse(ps.standby)
+            ps.on_event(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, GUID_CONSOLE_DISPLAY_STATE, 0); self.assertTrue(ps.standby)
+            ps.on_event(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, GUID_CONSOLE_DISPLAY_STATE, 2); self.assertFalse(ps.standby)
+            ps.on_event(WM_QUERYENDSESSION); self.assertTrue(ps.standby)
+            ps.on_event(WM_ENDSESSION, 0); self.assertFalse(ps.standby)
+            ps2 = PowerState(follow_display=False)
+            ps2.on_event(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, GUID_CONSOLE_DISPLAY_STATE, 0)
+            self.assertFalse(ps2.standby)
+
+        def test_sender_sleep_and_wake(self):
+            fakes = []
+            def factory():
+                f = FakeSdk(); fakes.append(f); return f
+            s = Sender(factory)
+            t = Telemetry(live=True, rpm=3000, gear="3")
+            s.send(t, now=0.0)
+            self.assertIn((ID_POWER, TYPE_INT, POWER_AWAKE), fakes[0].calls)
+            s.sleep(); s.sleep()
+            self.assertIn((ID_POWER, TYPE_INT, POWER_STANDBY), fakes[0].calls)
+            self.assertEqual(fakes[0].closed, 1)
+            n = len(fakes[0].calls)
+            s.send(t, now=1.0)                                   # asleep: nothing is sent, no reconnect
+            self.assertEqual(len(fakes), 1); self.assertEqual(len(fakes[0].calls), n)
+            s.wake(); s.send(t, now=2.0)
+            self.assertEqual(len(fakes), 2)                      # fresh connection after resume
+            self.assertIn((ID_POWER, TYPE_INT, POWER_AWAKE), fakes[1].calls)
+
+        def test_follow_power_drives_sender(self):
+            class W: standby = False
+            fake = FakeSdk(); s = Sender(lambda: fake); w = W()
+            s.send(Telemetry(live=True), now=0.0)
+            w.standby = True; follow_power(s, w); self.assertTrue(s.asleep)
+            w.standby = False; follow_power(s, w); self.assertFalse(s.asleep)
 
         def test_reconnects_after_failures(self):
             made = []
@@ -1362,26 +1682,37 @@ def selftest():
             self.assertEqual(len(attempts), 3)
             self.assertIsNone(s.sdk)
 
-        def _info_bytes(self, name="Thrustmaster T248", screens=1, leds=0, motors=2):
+        def _info_bytes(self, pid=0xB696, vid=0x044F, screens=1, leds=0, motors=2, junk_caps=False):
             b = bytearray(INFO_SIZE)
             struct.pack_into("<I", b, 0, INFO_SIZE)
-            struct.pack_into("<I", b, 0x08, 0x3F)
-            struct.pack_into("<11H", b, 0x0C, 6, 25, 0, 1, 0, 0, motors, 8, 0, leds, screens)
-            b[0x210:0x210 + 2 * (len(name) + 1)] = (name + "\0").encode("utf-16-le")
+            path = "\\\\?\\hid#vid_%04x&pid_%04x#6&1339b7b0&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}" % (vid, pid)
+            b[0x210:0x210 + 2 * (len(path) + 1)] = (path + "\0").encode("utf-16-le")
+            struct.pack_into("<I", b, 0x62C, 0x3F)
+            if junk_caps:                                    # what the old, wrong layout produced: ASCII letters
+                struct.pack_into("<11H", b, 0x630, 115, 116, 97, 100, 65, 101, 114, 32, 115, 116, 97)
+            else:
+                struct.pack_into("<11H", b, 0x630, 6, 25, 0, 1, 0, 0, motors, 8, 0, leds, screens)
             return bytes(b)
 
         def test_parse_device_info(self):
             inf = parse_device_info(self._info_bytes())
-            self.assertEqual((inf["name"], inf["screens"], inf["leds"], inf["motors"]), ("Thrustmaster T248", 1, 0, 2))
+            self.assertEqual((inf["name"], inf["vid"], inf["pid"]), ("Thrustmaster T248", 0x044F, 0xB696))
+            self.assertEqual((inf["screens"], inf["leds"], inf["motors"], inf["caps_ok"]), (1, 0, 2, True))
             self.assertEqual((inf["axes"], inf["buttons"], inf["force_slots"], inf["axes_mask"]), (6, 25, 8, 0x3F))
+            self.assertEqual(parse_device_info(self._info_bytes(pid=0x1234))["name"], "device 044F:1234")
             with self.assertRaises(ValueError):
                 parse_device_info(b"short")
             self.assertEqual(parse_device_info(bytes(INFO_SIZE))["name"], "(unnamed)")
 
+        def test_absurd_capabilities_are_flagged(self):
+            inf = parse_device_info(self._info_bytes(junk_caps=True))
+            self.assertFalse(inf["caps_ok"])
+            self.assertIn("unreadable", describe_device(0, inf))
+
         def test_pick_device(self):
             wheel = parse_device_info(self._info_bytes(screens=1))
-            pedals = parse_device_info(self._info_bytes("Pedals", screens=0, leds=0))
-            leds_only = parse_device_info(self._info_bytes("LED wheel", screens=0, leds=8))
+            pedals = parse_device_info(self._info_bytes(pid=0x1111, screens=0, leds=0))
+            leds_only = parse_device_info(self._info_bytes(pid=0x2222, screens=0, leds=8))
             self.assertEqual(pick_device([pedals, wheel])[0], 1)               # screen wins, wherever it is
             self.assertEqual(pick_device([pedals, leds_only])[0], 1)           # LEDs next best
             self.assertEqual(pick_device([pedals, pedals])[0], 0)              # nothing special: device 0
@@ -1390,6 +1721,82 @@ def selftest():
                 pick_device([wheel], 3)
             with self.assertRaises(RuntimeError):
                 pick_device([])
+
+        def test_pick_device_unreadable_caps_falls_back_to_thrustmaster(self):
+            other = parse_device_info(self._info_bytes(vid=0x1234, pid=1, junk_caps=True))
+            tm = parse_device_info(self._info_bytes(junk_caps=True))
+            idx, why = pick_device([other, tm])
+            self.assertEqual(idx, 1)
+            self.assertIn("not readable", why)
+
+        def _fake_tmsdk(self, calls):
+            """A TmSdk whose DLL is a stand-in that records the order of calls."""
+            sdk = object.__new__(TmSdk)
+            class Dll:
+                def tm_api_init(d, flags, ptr): calls.append(("init", flags)); return 0
+                def tm_api_get_device_count(d, ref): ref._obj.value = 1; calls.append(("count",)); return 0
+                def tm_api_get_device_info(d, i, addr):
+                    ctypes.memmove(addr, TestCase._info(), INFO_SIZE); calls.append(("info", i)); return 0
+                def tm_api_open_device(d, i, ref): ref._obj.value = 0x400; calls.append(("open", i)); return 0
+                def tm_api_update(d, flag, addr): return 0
+                def tm_api_close_device(d, h): calls.append(("close", h)); return 0
+                def tm_api_exit(d): calls.append(("exit",)); return 0
+            sdk.dll, sdk.handle = Dll(), None
+            sdk._rec, sdk._upd = ctypes.create_string_buffer(RECORD_SIZE), ctypes.create_string_buffer(0x2000)
+            return sdk
+
+        def test_sdk_call_order(self):
+            TestCase._info = staticmethod(lambda: self._info_bytes())
+            calls = []
+            sdk = self._fake_tmsdk(calls)
+            sdk.connect(None, 0x1234, 1.0)
+            self.assertEqual([c[0] for c in calls], ["init", "count", "info", "open"])
+            self.assertEqual(sdk.handle, 0x400)
+            calls.clear()
+            sdk2 = self._fake_tmsdk(calls)
+            sdk2.connect(None, 0x1234, 1.0, enumerate_devices=False)
+            self.assertEqual([c[0] for c in calls], ["init", "count", "open"])      # exactly the minimal sequence
+            sdk2.close()
+            self.assertEqual([c[0] for c in calls][-2:], ["close", "exit"])
+
+        def test_sender_close_is_idempotent(self):
+            fake = FakeSdk(); s = Sender(lambda: fake)
+            s.send(Telemetry(live=True, rpm=1000), now=0.0)
+            s.close(); s.close()
+            self.assertEqual(fake.closed, 1)
+
+        def test_gear_filter_hides_shift_flicker(self):
+            g = GearFilter(0.4)
+            self.assertEqual(g.update("3", 0.0), "3")
+            self.assertEqual(g.update("N", 0.10), "3")        # neutral during a shift: keep showing 3
+            self.assertEqual(g.update("N", 0.20), "3")
+            self.assertEqual(g.update("4", 0.25), "4")        # shift finished
+            self.assertEqual(g.update("N", 1.00), "4")        # a real neutral starts...
+            self.assertEqual(g.update("N", 1.30), "4")
+            self.assertEqual(g.update("N", 1.45), "N")        # ...and shows once it has lasted 0.4 s
+            self.assertEqual(g.update("N", 2.00), "N")
+            self.assertEqual(g.update("1", 2.10), "1")
+
+        def test_gear_filter_edges(self):
+            g = GearFilter(0.4)
+            self.assertEqual(g.update("N", 0.0), "N")         # nothing shown before: neutral appears at once
+            self.assertEqual(g.update("R", 0.1), "R")
+            self.assertEqual(g.update("N", 0.2), "R")
+            g.reset()
+            self.assertEqual(g.update("N", 5.0), "N")         # after a reset there is no previous gear
+            off = GearFilter(0)
+            off.update("3", 0.0)
+            self.assertEqual(off.update("N", 0.01), "N")      # delay 0 = pass through
+
+        def test_should_recycle(self):
+            self.assertFalse(should_recycle(5, False))        # not long enough
+            self.assertFalse(should_recycle(60, True))        # game still running (sitting in a menu)
+            self.assertTrue(should_recycle(11, False))        # game is gone
+
+        def test_vid_pid_parse_without_path(self):
+            inf = parse_device_info(bytes(INFO_SIZE))
+            self.assertIsNone(inf["vid"])
+            self.assertTrue(inf["caps_ok"])
 
         def _fake_pages(self):
             pages = {k: bytearray(1024) for k in ("physics", "graphics", "static")}
@@ -1636,6 +2043,7 @@ def selftest():
                 self.assertTrue(0 <= t.rpm_percent <= 100)
                 self.assertTrue(0 <= t.speed_kmh <= 181)
 
+    TestCase = T
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(T)
     res = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if res.wasSuccessful() else 1
@@ -1665,12 +2073,19 @@ def main():
     ap.add_argument("--simulate", action="store_true", help="send fake telemetry (no game needed)")
     ap.add_argument("--dry-run", action="store_true", help="read AC and print values; do not touch the wheel")
     ap.add_argument("--game", choices=sorted(("ac",)), default="ac", help="which game to read (currently only ac)")
-    ap.add_argument("--race-info", action="store_true", help="also send position / lap count (field meaning not fully verified)")
+    ap.add_argument("--neutral-delay", type=float, default=0.4,
+                    help="seconds neutral must last before it is shown, so shifts do not flash N (default 0.4, 0 = off)")
+    ap.add_argument("--race-info", action=argparse.BooleanOptionalAction, default=True, help="send position / cars / lap number / lap count (default on; --no-race-info disables)")
+    ap.add_argument("--power-follow", action=argparse.BooleanOptionalAction, default=True,
+                    help="put the wheel screen into standby when the computer sleeps, shuts down or turns its display off (default on)")
+    ap.add_argument("--power-test", action="store_true",
+                    help="step the screen power state 0, 1, 2, 1, 0 so you can see what each value does, then exit")
     ap.add_argument("--hold", type=float, default=8.0, help="seconds --probe keeps the test frame on screen (default 8)")
     ap.add_argument("--rate", type=float, default=30.0, help="updates per second (default 30)")
     ap.add_argument("--sdk-dir", help="folder containing tm_api_lib_x64.dll (the 'tmsdk' folder)")
     ap.add_argument("--dll", help="path to the 64-bit DLL that exports tm_api_* (default: searched automatically)")
     ap.add_argument("--device", default="auto", help="SDK device index, or 'auto' (default): a device with a screen first")
+    ap.add_argument("--no-enumerate", action="store_true", help="do not ask the SDK about each device before opening it (for troubleshooting)")
     ap.add_argument("--list-devices", action="store_true", help="show the Thrustmaster devices the SDK sees, and what each can do, then exit")
     ap.add_argument("--hwnd", help="window handle to give the SDK (e.g. 0x1A2B3C); default: the game window, or this console")
     ap.add_argument("--connect-timeout", type=float, default=8.0, help="seconds to wait for the SDK to find the wheel")
@@ -1721,7 +2136,8 @@ def main():
         def connect(idx=0):
             hwnd, what = resolve_hwnd(mode, explicit)
             log.info("Using %s as the SDK window: 0x%x", what, hwnd or 0)
-            orig(device_choice, hwnd, a.connect_timeout)
+            SDK_WINDOW["kind"] = what
+            orig(device_choice, hwnd, a.connect_timeout, not a.no_enumerate)
         sdk.connect = connect
         return sdk
 
@@ -1756,12 +2172,17 @@ def main():
         log.error("--no-wheel with no output chosen: add --serve, --udp or --dump")
         return 2
     sender = Sender(factory, race_info=a.race_info) if use_wheel else None
+    if sender is not None:
+        install_cleanup(sender.close, on_shutdown=sender.sleep)
+    power = PowerWatcher() if (sender is not None and a.power_follow and not a.probe and not a.power_test) else None
+    if a.power_test:
+        return run_power_test(sender) if sender else 2
     if a.probe:
         return run_probe(sender, a.hold) if sender else 2
     if a.simulate:
-        run_simulate(sender, a.rate, publisher)
+        run_simulate(sender, a.rate, publisher, power)
         return 0
-    run_follow(sender, a.rate, a.dry_run, SOURCES[a.game](), publisher)
+    run_follow(sender, a.rate, a.dry_run, SOURCES[a.game](neutral_delay=a.neutral_delay), publisher, power)
     return 0
 
 
