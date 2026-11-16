@@ -1233,8 +1233,17 @@ def simulate_frame(t_sec):
     return t
 
 
-def idle_frame():
-    return Telemetry(live=False, gear="N")
+def clock_ms(now=None):
+    """Time of day as a fake lap time: 14:20 becomes 14 min 20 s, which the screen shows as 14:20.000."""
+    lt = time.localtime(now)
+    return (lt.tm_hour * 60 + lt.tm_min) * 1000
+
+
+def idle_frame(clock=False, now=None):
+    t = Telemetry(live=False, gear="N")
+    if clock:
+        t.current_ms = clock_ms(now)
+    return t
 
 
 # --------------------------------------------------------------------------
@@ -1390,7 +1399,7 @@ def install_cleanup(callback, on_shutdown=None):
             log.debug("could not install console handler: %s", e)
 
 
-def run_follow(sender, rate, dry_run, reader, publisher=None, power=None):
+def run_follow(sender, rate, dry_run, reader, publisher=None, power=None, idle_clock=False):
     """sender: wheel output or None; publisher: external outputs or None."""
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *a: stop.update(flag=True))
@@ -1433,7 +1442,7 @@ def run_follow(sender, rate, dry_run, reader, publisher=None, power=None):
                             sender.close()                             # re-init with the next game window
                         reader.close(); connected = False              # the game has gone: look for it again
                     dead_since = time.monotonic()                      # in a menu: check again in 10 s
-            frame = t if t.live else idle_frame()
+            frame = t if t.live else idle_frame(idle_clock)
             state = (frame.live, frame.gear)
             if state != last_state:
                 log.info("state: live=%s gear=%s", frame.live, frame.gear)
@@ -1496,6 +1505,20 @@ def run_list_devices(factory):
         return 1
     finally:
         sdk.close()
+
+
+def run_clock_test(sender, seconds=20.0):
+    """Show the time of day in the lap-time field for a while, so you can see how the screen presents it."""
+    log.info("CLOCK TEST: showing %s as the current lap time for %.0f s. Watch the screen.",
+             time.strftime("%H:%M"), seconds)
+    end = time.monotonic() + seconds
+    try:
+        while time.monotonic() < end:
+            sender.send(idle_frame(clock=True))
+            time.sleep(0.2)
+    finally:
+        sender.close()
+    return 0
 
 
 def run_power_test(sender, step=4.0):
@@ -1647,6 +1670,12 @@ def selftest():
             s.wake(); s.send(t, now=2.0)
             self.assertEqual(len(fakes), 2)                      # fresh connection after resume
             self.assertIn((ID_POWER, TYPE_INT, POWER_AWAKE), fakes[1].calls)
+
+        def test_idle_clock(self):
+            ts = time.mktime((2026, 11, 16, 14, 20, 0, 0, 0, -1))
+            self.assertEqual(clock_ms(ts), 860000)               # shown as 14:20.000
+            self.assertEqual(idle_frame(True, ts).current_ms, 860000)
+            self.assertEqual(idle_frame().current_ms, 0)
 
         def test_follow_power_drives_sender(self):
             class W: standby = False
@@ -2078,6 +2107,10 @@ def main():
     ap.add_argument("--race-info", action=argparse.BooleanOptionalAction, default=True, help="send position / cars / lap number / lap count (default on; --no-race-info disables)")
     ap.add_argument("--power-follow", action=argparse.BooleanOptionalAction, default=True,
                     help="put the wheel screen into standby when the computer sleeps, shuts down or turns its display off (default on)")
+    ap.add_argument("--idle-clock", action=argparse.BooleanOptionalAction, default=False,
+                    help="show the time of day in the lap-time field while no game is running (default off: it only "
+                         "appears when the wheel is on its lap page, which the bridge cannot select)")
+    ap.add_argument("--clock-test", action="store_true", help="show the time of day on the screen for 20 s, then exit")
     ap.add_argument("--power-test", action="store_true",
                     help="step the screen power state 0, 1, 2, 1, 0 so you can see what each value does, then exit")
     ap.add_argument("--hold", type=float, default=8.0, help="seconds --probe keeps the test frame on screen (default 8)")
@@ -2175,6 +2208,8 @@ def main():
     if sender is not None:
         install_cleanup(sender.close, on_shutdown=sender.sleep)
     power = PowerWatcher() if (sender is not None and a.power_follow and not a.probe and not a.power_test) else None
+    if a.clock_test:
+        return run_clock_test(sender) if sender else 2
     if a.power_test:
         return run_power_test(sender) if sender else 2
     if a.probe:
@@ -2182,7 +2217,7 @@ def main():
     if a.simulate:
         run_simulate(sender, a.rate, publisher, power)
         return 0
-    run_follow(sender, a.rate, a.dry_run, SOURCES[a.game](neutral_delay=a.neutral_delay), publisher, power)
+    run_follow(sender, a.rate, a.dry_run, SOURCES[a.game](neutral_delay=a.neutral_delay), publisher, power, a.idle_clock)
     return 0
 
 
