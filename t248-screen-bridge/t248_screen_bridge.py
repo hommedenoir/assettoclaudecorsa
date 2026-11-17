@@ -1175,7 +1175,8 @@ class Sender:
         try:
             self._ensure(now)
             ok = True
-            ok &= self._send(ID_POWER, TYPE_INT, POWER_AWAKE, now)       # re-asserted every second: recovers a screen that dropped to standby
+            # record 0x49 disabled: it is not screen power; sending it made the screen show P
+            # ok &= self._send(ID_POWER, TYPE_INT, POWER_AWAKE, now)       # re-asserted every second: recovers a screen that dropped to standby
             ok &= self._send(ID_GEAR, TYPE_INT, ord(t.gear[0]), now)
             ok &= self._send(ID_RPM, TYPE_INT, t.rpm, now)
             ok &= self._send(ID_RPM_PERCENT, TYPE_DOUBLE, round(t.rpm_percent, 1), now, eps=0.05)
@@ -1660,7 +1661,7 @@ def selftest():
             s = Sender(factory)
             t = Telemetry(live=True, rpm=3000, gear="3")
             s.send(t, now=0.0)
-            self.assertIn((ID_POWER, TYPE_INT, POWER_AWAKE), fakes[0].calls)
+            self.assertNotIn(ID_POWER, [c[0] for c in fakes[0].calls])   # 0x49 is never sent while driving
             s.sleep(); s.sleep()
             self.assertIn((ID_POWER, TYPE_INT, POWER_STANDBY), fakes[0].calls)
             self.assertEqual(fakes[0].closed, 1)
@@ -1669,7 +1670,7 @@ def selftest():
             self.assertEqual(len(fakes), 1); self.assertEqual(len(fakes[0].calls), n)
             s.wake(); s.send(t, now=2.0)
             self.assertEqual(len(fakes), 2)                      # fresh connection after resume
-            self.assertIn((ID_POWER, TYPE_INT, POWER_AWAKE), fakes[1].calls)
+            self.assertNotIn(ID_POWER, [c[0] for c in fakes[1].calls])
 
         def test_idle_clock(self):
             ts = time.mktime((2026, 11, 16, 14, 20, 0, 0, 0, -1))
