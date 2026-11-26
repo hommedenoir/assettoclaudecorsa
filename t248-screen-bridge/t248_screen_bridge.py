@@ -37,6 +37,8 @@ app, but this program has not been run against a real wheel by its author.
 Run --probe first and send back t248_bridge.log if anything fails.
 """
 
+# Copyright (c) 2026 hommedenoir - PolyForm Noncommercial License 1.0.0 (see LICENSE.md)
+# Not affiliated with or endorsed by Thrustmaster / Guillemot or Kunos Simulazioni.
 BRIDGE_VERSION = "2026.11.26-dev"
 
 import argparse
