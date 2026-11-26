@@ -653,7 +653,7 @@ class AcReader(TelemetrySource):
                 self.close()
                 return False
             self.views[page] = opened
-        log.info("Mapped AC pages: %s", {k: v[2] for k, v in self.views.items()})
+        log.debug("Mapped AC pages: %s", {k: v[2] for k, v in self.views.items()})
         return True
 
     def _region_size(self, ptr):
@@ -1405,6 +1405,10 @@ def run_follow(sender, rate, dry_run, reader, publisher=None, power=None, idle_c
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *a: stop.update(flag=True))
     period, connected, last_state, dead_since = 1.0 / rate, False, None, None
+    # Log noise fix (2026-11-26): another program (e.g. Content Manager) can keep AC's shared memory
+    # open after the game exits, so it is "found" again every 10 s. Announce it only once, and again
+    # only after the game was actually live in between.
+    announced, seen_live = False, False
     checker = PlausibilityChecker()
     log.info("Following Assetto Corsa at %.0f Hz. Press Ctrl+C to stop.", rate)
     try:
@@ -1414,7 +1418,11 @@ def run_follow(sender, rate, dry_run, reader, publisher=None, power=None, idle_c
             if not connected:
                 connected = reader.open()
                 if connected:
-                    log.info("Assetto Corsa shared memory found")
+                    if not announced:
+                        log.info("Assetto Corsa shared memory found")
+                        announced = True
+                    else:
+                        log.debug("Assetto Corsa shared memory re-attached")
                 else:
                     time.sleep(1.0)
                     continue
@@ -1432,6 +1440,7 @@ def run_follow(sender, rate, dry_run, reader, publisher=None, power=None, idle_c
                 publisher.publish(values, t.live)
             if t.live:
                 dead_since = None
+                seen_live = True
             else:
                 dead_since = dead_since or time.monotonic()
                 waited = time.monotonic() - dead_since
@@ -1442,6 +1451,9 @@ def run_follow(sender, rate, dry_run, reader, publisher=None, power=None, idle_c
                             sender.send(idle_frame())                  # leave the wheel screen tidy
                             sender.close()                             # re-init with the next game window
                         reader.close(); connected = False              # the game has gone: look for it again
+                        if seen_live:
+                            log.info("Assetto Corsa closed; waiting for it to start again")
+                            announced, seen_live = False, False
                     dead_since = time.monotonic()                      # in a menu: check again in 10 s
             frame = t if t.live else idle_frame(idle_clock)
             state = (frame.live, frame.gear)

@@ -1,0 +1,15 @@
+# assettoclaudecorsa
+
+Assetto Corsa tools.
+
+## t248-screen-bridge
+Shows Assetto Corsa telemetry (gear, revs, speed, lap times, race info) on the built-in screen of a
+Thrustmaster T248, through Thrustmaster's own SDK. Can also serve a live web dashboard and send UDP.
+
+    python t248_screen_bridge.py --selftest      # logic tests, no hardware
+    python t248_screen_bridge.py --probe         # one test frame on the wheel
+    python t248_screen_bridge.py                 # normal use: follow Assetto Corsa
+
+Needs Windows, 64-bit Python 3.8+, the Thrustmaster driver package, and the original Assetto Corsa
+(AC EVO uses a different shared-memory layout). Run the script with --help for all options.
+Its log is written to t248_bridge.log next to the script.
