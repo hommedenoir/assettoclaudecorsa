@@ -18,10 +18,10 @@ You do **not** need Assetto Corsa for the test.
 1. Download `t248_screen_bridge.py` and `run_report.bat` into one folder.
 2. Close Assetto Corsa, other racing games and the Thrustmaster Control Panel.
 3. Double-click `run_report.bat`.
-4. It asks which wheel and base you have, then runs three short tests (about 35 seconds in total).
-   Watch the wheel's screen and LEDs during each test and answer the question afterwards:
+4. It asks which wheel and base you have, then runs three tests. Each test keeps running until you
+   press Enter, so take your time. Watch the wheel's screen and LEDs, then press Enter and answer:
    - **A:** gear 3 and 90 km/h should appear.
-   - **B:** the revs sweep up three times: do the rev lights / LEDs follow?
+   - **B:** the revs keep sweeping up: do the rev bar or / LEDs follow?
    - **C:** gears, speed, lap times and position change. On a T248 the screen shows one page at
      a time: use the wheel's buttons to flip through the pages during this test.
 5. It saves `t248_bridge_report.txt` in the same folder.

@@ -1570,30 +1570,44 @@ def run_report(factory, sender_factory, path):
          lambda t: Telemetry(live=True, gear="3", rpm=4500, rpm_percent=60.0, speed_kmh=90.0,
                              current_ms=65432 + int(t * 1000)),
          "Did the screen show gear 3 (and 90 km/h, if your screen shows speed)? (y/n, or describe)"),
-        ("B: rev sweep", "revs climb from idle to the limiter three times (watch the rev lights / LEDs)", 9.0,
+        ("B: rev sweep", "revs climb from idle to the limiter, over and over (watch the rev bar / LEDs)", 9.0,
          lambda t: Telemetry(live=True, gear="2", rpm=int(1000 + ((t % 3.0) / 3.0) * 6500),
                              rpm_percent=((t % 3.0) / 3.0) * 100.0, speed_kmh=60.0),
          "Did a rev bar or the LEDs follow the revs? (y/n, or describe)"),
         ("C: race info", "gears 1-5, speed, last/best lap, position 3 of 12, lap 2 of 5. "
-         "If your screen shows one page at a time (T248), switch pages with the wheel's buttons now", 20.0,
+         "If your screen shows one page at a time (T248), flip through the pages with the wheel's buttons", 20.0,
          lambda t: simulate_frame(t * 3.0),
          "Which pages/values showed real numbers? (gear / speed / revs / lap times / position / lap count)"),
     ]
     for name, what, secs, make, question in tests:
-        out("TEST %s: %s (%.0f s)" % (name, what, secs))
-        print("  Watch the wheel screen now...")
+        out("TEST %s: %s" % (name, what))
         sender = sender_factory()
         start = time.monotonic()
-        try:
-            while time.monotonic() - start < secs:
+        done = threading.Event()
+
+        def feed():
+            while not done.is_set():
                 sender.send(make(time.monotonic() - start))
                 time.sleep(0.05)
+
+        worker = threading.Thread(target=feed, daemon=True)
+        try:
+            worker.start()
+            # self-paced: the test runs until the tester presses Enter (no console: fixed time)
+            try:
+                input("  Watch the wheel screen. Take your time, then press Enter to stop this test.")
+            except (EOFError, OSError):
+                time.sleep(secs)
+            done.set()
+            worker.join(2.0)
+            out("  ran for %.0f s" % (time.monotonic() - start))
             codes = {("0x%02x" % k[0], k[1]): v for k, v in sender.rc_seen.items()}
             out("  connected: %s" % ("yes" if sender.sdk is not None else "NO"))
             out("  return codes (property id, code) -> count: %s" % codes)
         except Exception as e:
             out("  ERROR: %s" % e)
         finally:
+            done.set()
             try:
                 sender.close()
             except Exception:
