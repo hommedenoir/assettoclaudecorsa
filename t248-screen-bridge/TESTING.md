@@ -26,9 +26,13 @@ You do **not** need Assetto Corsa for the test.
      a time: use the wheel's buttons to flip through the pages during this test.
 5. It saves `t248_bridge_report.txt` in the same folder.
 
-## Send back
-`t248_bridge_report.txt` and `t248_bridge.log` (same folder), as a GitHub issue or however
-you were asked. Photos or a short video of the screen during the test help a lot.
+## Send back (pick one)
+- **With a GitHub account:** open the [test report form](https://github.com/hommedenoir/assettoclaudecorsa/issues/new?template=test-report.yml),
+  tick what you saw, and drag in `t248_bridge_report.txt` and `t248_bridge.log`.
+- **Without one:** reply to the post where you found this and paste the contents of
+  `t248_bridge_report.txt` (it's short).
+
+Photos or a short video of the screen during the test help a lot.
 
 ## Is it safe?
 The tool only talks to your wheel through Thrustmaster's own driver (the same interface games

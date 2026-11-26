@@ -1622,7 +1622,9 @@ def run_report(factory, sender_factory, path):
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         print("\nReport saved to: %s" % path)
-        print("Please send this file (and t248_bridge.log from the same folder) back. Thank you!")
+        print("Please send it back, together with t248_bridge.log from the same folder:")
+        print("  GitHub: https://github.com/hommedenoir/assettoclaudecorsa/issues/new?template=test-report.yml")
+        print("  or paste the report as a reply to the post where you found this tool. Thank you!")
     except OSError as e:
         print("Could not save the report (%s). Please copy the text above instead." % e)
     return 0

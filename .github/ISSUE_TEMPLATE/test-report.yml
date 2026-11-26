@@ -1,0 +1,62 @@
+name: Wheel screen test report
+description: Share the result of the 2-minute test (run_report.bat) on your Thrustmaster wheel.
+title: "[Test] <your wheel> on <your base>"
+labels: ["test report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! This takes about a minute.
+        Haven't run the test yet? See [TESTING.md](https://github.com/hommedenoir/assettoclaudecorsa/blob/main/t248-screen-bridge/TESTING.md).
+  - type: dropdown
+    id: wheel
+    attributes:
+      label: Wheel / rim with the screen
+      options:
+        - Ferrari SF1000 rim
+        - T248
+        - T248R
+        - Other (write it under "Anything else")
+    validations:
+      required: true
+  - type: dropdown
+    id: base
+    attributes:
+      label: Base
+      options:
+        - Built in (T248 / T248R)
+        - T300 / T300RS
+        - TX
+        - TS-XW
+        - TS-PC
+        - T-GT / T-GT II
+        - T598
+        - T818
+        - Other (write it under "Anything else")
+    validations:
+      required: true
+  - type: checkboxes
+    id: results
+    attributes:
+      label: What did you see?
+      description: Tick everything that worked.
+      options:
+        - label: "Test A: gear 3 appeared"
+        - label: "Test B: the rev bar or LEDs followed the revs"
+        - label: "Test C: the gear changed"
+        - label: "Test C: speed showed real numbers"
+        - label: "Test C: lap times showed real numbers"
+        - label: "Test C: position / lap count showed real numbers"
+  - type: textarea
+    id: files
+    attributes:
+      label: Report files
+      description: Drag `t248_bridge_report.txt` and `t248_bridge.log` (same folder as the tool) into this box. Photos or a short video of the screen are very welcome too.
+      placeholder: Drop the two files here
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Anything odd, missing or nice. Optional.
