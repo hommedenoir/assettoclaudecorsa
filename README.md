@@ -13,3 +13,6 @@ Thrustmaster T248, through Thrustmaster's own SDK. Can also serve a live web das
 Needs Windows, 64-bit Python 3.8+, the Thrustmaster driver package, and the original Assetto Corsa
 (AC EVO uses a different shared-memory layout). Run the script with --help for all options.
 Its log is written to t248_bridge.log next to the script.
+
+**Testers wanted** (Ferrari SF1000 rim, T248R, other T248s): see [t248-screen-bridge/TESTING.md](t248-screen-bridge/TESTING.md).
+The test is `run_report.bat` (or `python t248_screen_bridge.py --report`).

@@ -37,12 +37,15 @@ app, but this program has not been run against a real wheel by its author.
 Run --probe first and send back t248_bridge.log if anything fails.
 """
 
+BRIDGE_VERSION = "2026.11.26-dev"
+
 import argparse
 import ctypes
 import glob
 import json
 import logging
 import os
+import platform
 import math
 import re
 import signal
@@ -1520,6 +1523,96 @@ def run_list_devices(factory):
         sdk.close()
 
 
+def _ask(question):
+    """Ask the tester a short question; returns their answer (empty if no console)."""
+    try:
+        return input("  " + question + " ").strip()
+    except (EOFError, OSError):
+        return ""
+
+
+def run_report(factory, sender_factory, path):
+    """Tester mode: list devices, run three short screen tests, ask what was seen, write one report file."""
+    lines = []
+
+    def out(text=""):
+        print(text)
+        lines.append(text)
+
+    out("T248 screen bridge test report")
+    out("bridge version: %s" % BRIDGE_VERSION)
+    out("date: %s" % time.strftime("%Y-%m-%d %H:%M"))
+    out("python: %s (%d-bit)" % (sys.version.split()[0], struct.calcsize("P") * 8))
+    out("windows: %s" % (" ".join(platform.win32_ver()[:2]) if os.name == "nt" else platform.platform()))
+    out("")
+    wheel_name = _ask("Which wheel and base are you testing (e.g. 'SF1000 on T-GT')?")
+    out("tester's wheel/base: %s" % (wheel_name or "(not given)"))
+    out("")
+
+    sdk = factory()
+    try:
+        hwnd, _ = resolve_hwnd("console")
+        n = sdk.start(hwnd, 8.0)
+        infos = sdk.enumerate(n)
+        out("SDK reports %d device(s):" % n)
+        for i, inf in enumerate(infos):
+            out("  " + describe_device(i, inf))
+        idx, why = pick_device(infos, None)
+        out("automatic choice: device #%d (%s)" % (idx, why))
+    except Exception as e:
+        out("ERROR listing devices: %s" % e)
+    finally:
+        sdk.close()
+    out("")
+
+    tests = [
+        ("A: static frame", "gear 3, 4500 rpm, 90 km/h, lap time running", 6.0,
+         lambda t: Telemetry(live=True, gear="3", rpm=4500, rpm_percent=60.0, speed_kmh=90.0,
+                             current_ms=65432 + int(t * 1000)),
+         "Did the screen show gear 3 and a speed of 90? (y/n, or describe)"),
+        ("B: rev sweep", "revs climb from idle to the limiter three times (watch the rev lights / LEDs)", 9.0,
+         lambda t: Telemetry(live=True, gear="2", rpm=int(1000 + ((t % 3.0) / 3.0) * 6500),
+                             rpm_percent=((t % 3.0) / 3.0) * 100.0, speed_kmh=60.0),
+         "Did a rev bar or the LEDs follow the revs? (y/n, or describe)"),
+        ("C: race info", "gears 1-5, speed, last/best lap, position 3 of 12, lap 2 of 5", 10.0,
+         lambda t: simulate_frame(t * 3.0),
+         "What did you see change? (gear / speed / lap times / position / nothing)"),
+    ]
+    for name, what, secs, make, question in tests:
+        out("TEST %s: %s (%.0f s)" % (name, what, secs))
+        print("  Watch the wheel screen now...")
+        sender = sender_factory()
+        start = time.monotonic()
+        try:
+            while time.monotonic() - start < secs:
+                sender.send(make(time.monotonic() - start))
+                time.sleep(0.05)
+            codes = {("0x%02x" % k[0], k[1]): v for k, v in sender.rc_seen.items()}
+            out("  connected: %s" % ("yes" if sender.sdk is not None else "NO"))
+            out("  return codes (property id, code) -> count: %s" % codes)
+        except Exception as e:
+            out("  ERROR: %s" % e)
+        finally:
+            try:
+                sender.close()
+            except Exception:
+                pass
+        out("  tester saw: %s" % (_ask(question) or "(no answer)"))
+        out("")
+
+    notes = _ask("Anything else you noticed? (Enter to skip)")
+    if notes:
+        out("tester notes: %s" % notes)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print("\nReport saved to: %s" % path)
+        print("Please send this file (and t248_bridge.log from the same folder) back. Thank you!")
+    except OSError as e:
+        print("Could not save the report (%s). Please copy the text above instead." % e)
+    return 0
+
+
 def run_clock_test(sender, seconds=20.0):
     """Show the time of day in the lap-time field for a while, so you can see how the screen presents it."""
     log.info("CLOCK TEST: showing %s as the current lap time for %.0f s. Watch the screen.",
@@ -2132,6 +2225,9 @@ def main():
     ap.add_argument("--dll", help="path to the 64-bit DLL that exports tm_api_* (default: searched automatically)")
     ap.add_argument("--device", default="auto", help="SDK device index, or 'auto' (default): a device with a screen first")
     ap.add_argument("--no-enumerate", action="store_true", help="do not ask the SDK about each device before opening it (for troubleshooting)")
+    ap.add_argument("--report", action="store_true",
+                    help="TESTERS: list devices, run three short screen tests, ask what you saw, save t248_bridge_report.txt")
+    ap.add_argument("--version", action="version", version=BRIDGE_VERSION)
     ap.add_argument("--list-devices", action="store_true", help="show the Thrustmaster devices the SDK sees, and what each can do, then exit")
     ap.add_argument("--hwnd", help="window handle to give the SDK (e.g. 0x1A2B3C); default: the game window, or this console")
     ap.add_argument("--connect-timeout", type=float, default=8.0, help="seconds to wait for the SDK to find the wheel")
@@ -2173,7 +2269,7 @@ def main():
         log.error("--device must be 'auto' or a number")
         return 2
     explicit = int(a.hwnd, 0) if a.hwnd else None
-    mode = "game" if not (a.probe or a.simulate) else "console"
+    mode = "game" if not (a.probe or a.simulate or a.report) else "console"
 
     def factory():
         sdk = TmSdk(a.sdk_dir, a.dll)
@@ -2189,6 +2285,9 @@ def main():
 
     if a.list_devices:
         return run_list_devices(factory)
+    if a.report:
+        log.info("REPORT mode, bridge version %s", BRIDGE_VERSION)
+        return run_report(factory, lambda: Sender(factory, race_info=True), os.path.join(here, "t248_bridge_report.txt"))
 
     sinks = []
     try:
