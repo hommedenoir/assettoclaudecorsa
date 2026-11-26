@@ -17,6 +17,15 @@ Its log is written to t248_bridge.log next to the script.
 **Testers wanted** (Ferrari SF1000 rim, T248R, other T248s): see [t248-screen-bridge/TESTING.md](t248-screen-bridge/TESTING.md).
 The test is `run_report.bat` (or `python t248_screen_bridge.py --report`).
 
+## Roadmap
+- Testers: Ferrari SF1000 rim, T248R, other T248s (see TESTING.md)
+- GTA V: read the Manual Transmission mod's UDP telemetry and drive the wheel screen
+- GTR2 support
+- **Linux support** (Proton/Wine): check whether the Thrustmaster SDK calls pass through; otherwise finish
+  decoding the raw USB screen protocol (checksum still unknown). Needs a Linux test drive first.
+- SF1000 over Wi-Fi: send the rim's UDP telemetry format directly
+- Optional SimHub bridge using the UDP/JSON output
+
 ## Licence
 Copyright (c) 2026 hommedenoir. Free for personal, non-commercial use under the
 [PolyForm Noncommercial License 1.0.0](LICENSE.md). Commercial use needs written permission
