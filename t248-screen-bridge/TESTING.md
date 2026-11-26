@@ -21,7 +21,7 @@ You do **not** need Assetto Corsa for the test.
 4. It asks which wheel and base you have, then runs three tests. Each test keeps running until you
    press Enter, so take your time. Watch the wheel's screen and LEDs, then press Enter and answer:
    - **A:** gear 3 and 90 km/h should appear.
-   - **B:** the revs keep sweeping up: do the rev bar or / LEDs follow?
+   - **B:** the revs keep sweeping up: does the rev bar (or do the LEDs) follow?
    - **C:** gears, speed, lap times and position change. On a T248 the screen shows one page at
      a time: use the wheel's buttons to flip through the pages during this test.
 5. It saves `t248_bridge_report.txt` in the same folder.
