@@ -1569,14 +1569,15 @@ def run_report(factory, sender_factory, path):
         ("A: static frame", "gear 3, 4500 rpm, 90 km/h, lap time running", 6.0,
          lambda t: Telemetry(live=True, gear="3", rpm=4500, rpm_percent=60.0, speed_kmh=90.0,
                              current_ms=65432 + int(t * 1000)),
-         "Did the screen show gear 3 and a speed of 90? (y/n, or describe)"),
+         "Did the screen show gear 3 (and 90 km/h, if your screen shows speed)? (y/n, or describe)"),
         ("B: rev sweep", "revs climb from idle to the limiter three times (watch the rev lights / LEDs)", 9.0,
          lambda t: Telemetry(live=True, gear="2", rpm=int(1000 + ((t % 3.0) / 3.0) * 6500),
                              rpm_percent=((t % 3.0) / 3.0) * 100.0, speed_kmh=60.0),
          "Did a rev bar or the LEDs follow the revs? (y/n, or describe)"),
-        ("C: race info", "gears 1-5, speed, last/best lap, position 3 of 12, lap 2 of 5", 10.0,
+        ("C: race info", "gears 1-5, speed, last/best lap, position 3 of 12, lap 2 of 5. "
+         "If your screen shows one page at a time (T248), switch pages with the wheel's buttons now", 20.0,
          lambda t: simulate_frame(t * 3.0),
-         "What did you see change? (gear / speed / lap times / position / nothing)"),
+         "Which pages/values showed real numbers? (gear / speed / revs / lap times / position / lap count)"),
     ]
     for name, what, secs, make, question in tests:
         out("TEST %s: %s (%.0f s)" % (name, what, secs))
